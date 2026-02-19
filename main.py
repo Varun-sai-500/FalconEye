@@ -62,12 +62,9 @@ if bbox:
 
 rover = RoverController("./rover_controller")
 
-track = input("Do you want to track this object? (y/n): ").strip().lower()
-if track == 'y':
-    tracker = DaSiamRPNTracker()
-    bbox = tracker.init_from_mask(rgb_frame, mask)
-    print("[INFO] Initialized with bbox:", bbox)
-
+tracker = DaSiamRPNTracker()
+bbox = tracker.init_from_mask(rgb_frame, mask)
+print("[INFO] Initialized with bbox:", bbox)
 try:
     for box in tracker.track_live(video_src=0, display=True):
         print("BBox:", box)
