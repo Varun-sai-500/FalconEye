@@ -80,11 +80,8 @@ target/
 .ipynb_checkpoints
 
 #model weights
-/models/
-models/
-
-
-
+*.pth
+*.model
 # IPython
 profile_default/
 ipython_config.py
