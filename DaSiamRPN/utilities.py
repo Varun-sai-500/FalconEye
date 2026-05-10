@@ -10,27 +10,10 @@ def to_numpy(tensor):
                          .format(type(tensor)))
     return tensor
 
-
-def to_torch(ndarray):
-    if type(ndarray).__module__ == 'numpy':
-        return torch.from_numpy(ndarray)
-    elif not torch.is_tensor(ndarray):
-        raise ValueError("Cannot convert {} to torch tensor"
-                         .format(type(ndarray)))
-    return ndarray
-
-
 def im_to_numpy(img):
     img = to_numpy(img)
     img = np.transpose(img, (1, 2, 0))  # H*W*C
     return img
-
-
-def im_to_torch(img):
-    img = np.transpose(img, (2, 0, 1))  # C*H*W
-    img = to_torch(img).float()
-    return img
-
 
 def torch_to_img(img):
     img = to_numpy(torch.squeeze(img, 0))
@@ -81,7 +64,8 @@ def get_subwindow_tracking(im, pos, model_sz, original_sz, avg_chans, out_mode='
     else:
         im_patch = im_patch_original
 
-    return im_to_torch(im_patch) if out_mode in 'torch' else im_patch
+    im_patch = im_patch.transpose(2, 0, 1).astype(np.float32)  # HWC → CHW
+    return im_patch
 
 
 def cxy_wh_2_rect(pos, sz):
