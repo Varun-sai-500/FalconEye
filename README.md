@@ -181,9 +181,8 @@ This makes FalconEye suitable for **commercial robotics use-cases** where reliab
 
 
 ## How to run
-Download SAM model and keep it in models/ folder
 
-**- Download the SAM model to ckpt folder for running the code**
+**- Download the SAM model to models folder for running the code**
 
 1. SAM vit_b (default) : https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
 
