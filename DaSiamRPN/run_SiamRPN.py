@@ -1,12 +1,7 @@
-# --------------------------------------------------------
-# DaSiamRPN
-# Licensed under The MIT License
-# Written by Qiang Wang (wangqiang2015 at ia.ac.cn)
-# --------------------------------------------------------
 import numpy as np
-from torch.autograd import Variable
+import torch
 import torch.nn.functional as F
-from utils import get_subwindow_tracking
+from utilities import get_subwindow_tracking
 
 def generate_anchor(total_stride, scales, ratios, score_size):
     anchor_num = len(ratios) * len(scales)
@@ -62,43 +57,65 @@ class TrackerConfig(object):
 
 
 def tracker_eval(net, x_crop, target_pos, target_sz, window, scale_z, p):
-    delta, score = net(x_crop)
+    if isinstance(net, torch.nn.Module):
+        x_crop = torch.from_numpy(x_crop).float()
 
-    delta = delta.permute(1, 2, 3, 0).contiguous().view(4, -1).data.cpu().numpy()
-    score = F.softmax(score.permute(1, 2, 3, 0).contiguous().view(2, -1), dim=0).data[1, :].cpu().numpy()
+        if torch.cuda.is_available():
+            x_crop = x_crop.cuda()
 
+        with torch.no_grad():
+            delta, score = net(x_crop)
+
+        delta = delta.cpu().numpy()
+        score = score.cpu().numpy()
+
+    else:
+        # ONNX path
+        delta, score = net(x_crop)
+
+    # reshape (match original torch logic)
+    delta = delta.transpose(1, 2, 3, 0).reshape(4, -1)
+    score = score.transpose(1, 2, 3, 0).reshape(2, -1)
+
+    # softmax (numpy version)
+    score = score - np.max(score, axis=0, keepdims=True)
+    np.exp(score, out=score)
+    score /= np.sum(score, axis=0, keepdims=True)
+    score = score[1, :]
+
+    # bbox decode
     delta[0, :] = delta[0, :] * p.anchor[:, 2] + p.anchor[:, 0]
     delta[1, :] = delta[1, :] * p.anchor[:, 3] + p.anchor[:, 1]
     delta[2, :] = np.exp(delta[2, :]) * p.anchor[:, 2]
     delta[3, :] = np.exp(delta[3, :]) * p.anchor[:, 3]
 
+    # helper functions
     def change(r):
-        return np.maximum(r, 1./r)
+        return np.maximum(r, 1. / r)
 
     def sz(w, h):
         pad = (w + h) * 0.5
-        sz2 = (w + pad) * (h + pad)
-        return np.sqrt(sz2)
+        return np.sqrt((w + pad) * (h + pad))
 
     def sz_wh(wh):
         pad = (wh[0] + wh[1]) * 0.5
-        sz2 = (wh[0] + pad) * (wh[1] + pad)
-        return np.sqrt(sz2)
+        return np.sqrt((wh[0] + pad) * (wh[1] + pad))
 
-    # size penalty
-    s_c = change(sz(delta[2, :], delta[3, :]) / (sz_wh(target_sz)))  # scale penalty
-    r_c = change((target_sz[0] / target_sz[1]) / (delta[2, :] / delta[3, :]))  # ratio penalty
+    # penalties
+    s_c = change(sz(delta[2, :], delta[3, :]) / sz_wh(target_sz))
+    r_c = change((target_sz[0] / target_sz[1]) / (delta[2, :] / delta[3, :]))
 
     penalty = np.exp(-(r_c * s_c - 1.) * p.penalty_k)
     pscore = penalty * score
 
-    # window float
+    # windowing
     pscore = pscore * (1 - p.window_influence) + window * p.window_influence
-    best_pscore_id = np.argmax(pscore)
 
-    target = delta[:, best_pscore_id] / scale_z
+    best_id = np.argmax(pscore)
+
+    target = delta[:, best_id] / scale_z
     target_sz = target_sz / scale_z
-    lr = penalty[best_pscore_id] * score[best_pscore_id] * p.lr
+    lr = penalty[best_id] * score[best_id] * p.lr
 
     res_x = target[0] + target_pos[0]
     res_y = target[1] + target_pos[1]
@@ -108,7 +125,8 @@ def tracker_eval(net, x_crop, target_pos, target_sz, window, scale_z, p):
 
     target_pos = np.array([res_x, res_y])
     target_sz = np.array([res_w, res_h])
-    return target_pos, target_sz, score[best_pscore_id]
+
+    return target_pos, target_sz, score[best_id]
 
 
 def SiamRPN_init(im, target_pos, target_sz, net):
@@ -128,7 +146,7 @@ def SiamRPN_init(im, target_pos, target_sz, net):
 
     p.anchor = generate_anchor(p.total_stride, p.scales, p.ratios, int(p.score_size))
 
-    avg_chans = np.mean(im, axis=(0, 1))
+    avg_chans = np.mean(im, axis=(0, 1)).astype(np.float32)
 
     wc_z = target_sz[0] + p.context_amount * sum(target_sz)
     hc_z = target_sz[1] + p.context_amount * sum(target_sz)
@@ -136,8 +154,8 @@ def SiamRPN_init(im, target_pos, target_sz, net):
     # initialize the exemplar
     z_crop = get_subwindow_tracking(im, target_pos, p.exemplar_size, s_z, avg_chans)
 
-    z = Variable(z_crop.unsqueeze(0))
-    net.temple(z.cpu())
+    z = torch.from_numpy(z_crop).float().unsqueeze(0)
+    net.temple(z)
 
     if p.windowing == 'cosine':
         window = np.outer(np.hanning(p.score_size), np.hanning(p.score_size))
@@ -171,9 +189,11 @@ def SiamRPN_track(state, im):
     s_x = s_z + 2 * pad
 
     # extract scaled crops for search region x at previous target position
-    x_crop = Variable(get_subwindow_tracking(im, target_pos, p.instance_size, round(s_x), avg_chans).unsqueeze(0))
+    x_crop = np.expand_dims(
+        get_subwindow_tracking(im, target_pos, p.instance_size, round(s_x), avg_chans),axis=0
+    )
 
-    target_pos, target_sz, score = tracker_eval(net, x_crop.cpu(), target_pos, target_sz * scale_z, window, scale_z, p)
+    target_pos, target_sz, score = tracker_eval(net, x_crop, target_pos, target_sz * scale_z, window, scale_z, p)
     target_pos[0] = max(0, min(state['im_w'], target_pos[0]))
     target_pos[1] = max(0, min(state['im_h'], target_pos[1]))
     target_sz[0] = max(10, min(state['im_w'], target_sz[0]))
