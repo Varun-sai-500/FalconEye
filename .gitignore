@@ -7,6 +7,9 @@ __pycache__/
 *.so
 *.exe
 
+# gradio
+.gradio/
+
 # Distribution / packaging
 .Python
 build/
@@ -71,6 +74,9 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+
+/weights
+weights/
 
 # PyBuilder
 .pybuilder/

@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from utilities import get_subwindow_tracking
+from core.utils.utilities import get_subwindow_tracking
 
 def generate_anchor(total_stride, scales, ratios, score_size):
     anchor_num = len(ratios) * len(scales)
@@ -155,6 +155,7 @@ def SiamRPN_init(im, target_pos, target_sz, net):
     z_crop = get_subwindow_tracking(im, target_pos, p.exemplar_size, s_z, avg_chans)
 
     z = torch.from_numpy(z_crop).float().unsqueeze(0)
+    z = z.to(next(net.parameters()).device)
     net.temple(z)
 
     if p.windowing == 'cosine':
@@ -171,8 +172,8 @@ def SiamRPN_init(im, target_pos, target_sz, net):
     state['target_sz'] = target_sz
     return state
 
-
 def SiamRPN_track(state, im):
+
     p = state['p']
     net = state['net']
     avg_chans = state['avg_chans']
@@ -188,17 +189,38 @@ def SiamRPN_track(state, im):
     pad = d_search / scale_z
     s_x = s_z + 2 * pad
 
-    # extract scaled crops for search region x at previous target position
+
+    # extract search crop
     x_crop = np.expand_dims(
-        get_subwindow_tracking(im, target_pos, p.instance_size, round(s_x), avg_chans),axis=0
+        get_subwindow_tracking(
+            im,
+            target_pos,
+            p.instance_size,
+            round(s_x),
+            avg_chans,
+        ),
+        axis=0,
     )
 
-    target_pos, target_sz, score = tracker_eval(net, x_crop, target_pos, target_sz * scale_z, window, scale_z, p)
+
+    target_pos, target_sz, score = tracker_eval(
+        net,
+        x_crop,
+        target_pos,
+        target_sz * scale_z,
+        window,
+        scale_z,
+        p,
+    )
+
+
     target_pos[0] = max(0, min(state['im_w'], target_pos[0]))
     target_pos[1] = max(0, min(state['im_h'], target_pos[1]))
     target_sz[0] = max(10, min(state['im_w'], target_sz[0]))
     target_sz[1] = max(10, min(state['im_h'], target_sz[1]))
+
     state['target_pos'] = target_pos
     state['target_sz'] = target_sz
     state['score'] = score
+
     return state
