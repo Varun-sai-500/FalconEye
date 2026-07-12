@@ -323,12 +323,12 @@ with gr.Blocks(title="FalconEye") as demo:
             fps_display = gr.HTML('<p class="fps-display"></p>')
             track_status = gr.HTML('<p class="status-txt"></p>')
 
-            with gr.Group(visible=False) as action_group:
+            with gr.Column(visible=False) as action_group:
                 gr.HTML('<p class="step-label" style="margin-top:10px;">3 — tracking</p>')
                 track_init_btn    = gr.Button("Initialize tracker", variant="secondary")
                 track_init_status = gr.HTML('<p class="status-txt"></p>')
 
-                with gr.Group(visible=False) as live_group:
+                with gr.Column(visible=False) as live_group:
                     with gr.Row():
                         track_btn  = gr.Button("Track",  variant="primary")
                         follow_btn = gr.Button("Follow", variant="primary")
