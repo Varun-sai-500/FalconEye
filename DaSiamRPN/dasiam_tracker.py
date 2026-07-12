@@ -7,9 +7,9 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from net import SiamRPNvot
-from run_SiamRPN import SiamRPN_init, SiamRPN_track
-from utilities import cxy_wh_2_rect
+from utils.net import SiamRPNvot
+from utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
+from utils.utilities import cxy_wh_2_rect
 
 torch.set_grad_enabled(False)
 

@@ -182,25 +182,11 @@ This makes FalconEye suitable for **commercial robotics use-cases** where reliab
 
 ## How to run
 
-**- Download the SAM model to models folder for running the code**
-
-1. SAM vit_b (default) : https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
-
-2. SAM vit_l: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth
-
-3. SAM vit_h: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
-
 **- Download DaSiamrpn model and keep it in models/ folder**
 DaSiamRPN - https://drive.google.com/file/d/1G9GtKpF36-AwjyRXVLH_gHvrfVSCZMa7/view
 
 then install requirements from requirements.txt
 and run main.py
-
-
-## 📄 Technical Report
-
-A detailed technical description of FalconEye is available here:
-[Read the full technical report](assets/FalconEye_Research_Paper.pdf)
 
 ---
 
