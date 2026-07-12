@@ -180,13 +180,45 @@ This makes FalconEye suitable for **commercial robotics use-cases** where reliab
 ---
 
 
-## How to run
+## How to Run
 
-**- Download DaSiamrpn model and keep it in models/ folder**
-DaSiamRPN - https://drive.google.com/file/d/1G9GtKpF36-AwjyRXVLH_gHvrfVSCZMa7/view
+### 1. Download the model checkpoints
 
-then install requirements from requirements.txt
-and run main.py
+Run the checkpoint download script:
+
+```bash
+bash script/download_ckpt.sh
+```
+
+### 2. Install the dependencies
+
+Run the installation script:
+
+```bash
+bash script/install.sh
+```
+
+> **Note:** Before running the installation script, update it with the appropriate PyTorch wheel for your platform (e.g., Jetson, CUDA version, or CPU-only environment).
+
+### 3. Launch the application
+
+#### Gradio Interface
+
+```bash
+python app.py
+```
+
+#### FastAPI Server
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8080
+```
+
+Development Notes:
+
+Run the FastAPI server without --reload for normal usage.
+If you need auto-reload during development, use the watchfiles reloader.
+When using watchfiles, configure it to ignore large model files (such as *.onnx) to avoid unnecessary reloads.
 
 ---
 
@@ -198,10 +230,5 @@ and run main.py
 
 ---
 
-## 👨‍💻 Author
 
-**P. Varun Sai**
-Department of Computer Science & Engineering
-Keshav Memorial Institute of Technology
-Hyderabad, India
 
