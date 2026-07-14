@@ -7,7 +7,7 @@ python -m pip install --upgrade pip
 # https://pytorch.org/get-started/locally/
 # Only change the wheel index (cu118, cu121, cpu, etc.)
 
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 python -m pip install transformers/
 opencv-python-headless /

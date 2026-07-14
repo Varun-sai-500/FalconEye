@@ -195,6 +195,45 @@ If you need auto-reload during development, use the watchfiles reloader.
 When using watchfiles, configure it to ignore large model files (such as *.onnx) to avoid unnecessary reloads as it is reset the tracker giving you errors.
 
 ---
+## 🐳 Docker
+
+FalconEye provides a single Docker image that contains the complete application stack, including all models, dependencies, and shared modules.
+
+Using Docker Compose, two independent services are launched from the same image:
+
+```
+                FalconEye Image
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+          ▼                         ▼
+     FastAPI Service          Gradio Service
+      Port: 8080               Port: 7860
+```
+
+- **FastAPI (`api/main.py`)** exposes REST endpoints for segmentation, tracking, and following.
+- **Gradio (`app.py`)** provides an interactive web interface for experimentation and demonstrations.
+- Both services share the same codebase, models, and weights while running as independent containers.
+
+### Build and Run
+
+```bash
+docker compose up --build
+```
+
+After startup:
+
+| Service | URL |
+|---------|-----|
+| Gradio UI | http://localhost:7860 |
+| FastAPI API | http://localhost:8080 |
+| Swagger Docs | http://localhost:8080/docs |
+
+To stop all services:
+
+```bash
+docker compose down
+```
 
 ## 🌐 REST API
 

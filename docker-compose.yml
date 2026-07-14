@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    container_name: falconeye-api
+    command: >
+      uvicorn api.main:app
+      --host 0.0.0.0
+      --port 8080
+    ports:
+      - "8080:8080"
+
+  gradio:
+    build: .
+    container_name: falconeye-gradio
+    command: python app.py
+    ports:
+      - "7860:7860"
