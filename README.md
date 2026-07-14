@@ -14,6 +14,24 @@
   <img src="assets/demo.gif" alt="FalconEye Demo" width="900">
 </p>
 
+## 📑 Table of Contents
+
+- [What is FalconEye?](#what-is-falconeye)
+- [Why FalconEye?](#why-falconeye)
+- [End-to-End Pipeline](#end-to-end-pipeline)
+- [Features](#features)
+- [Software Architecture](#️-software-architecture)
+- [System Deployment Architecture](#system-deployment-architecture)
+- [Key Engineering Decisions](#key-engineering-decisions)
+- [Repository Structure](#-repository-structure)
+- [Getting Started](#getting-started)
+- [Docker](#-docker)
+- [REST API](#-rest-api)
+- [Runtime Backends](#-runtime-backends)
+- [Roadmap](#-roadmap)
+- [Acknowledgements](#-acknowledgements)
+- [Citation](#-citation)
+
 ## What is FalconEye?
 
 FalconEye is a real-time visual tracking and autonomous following system.
@@ -146,7 +164,7 @@ The repository follows a modular architecture that separates the presentation la
 
 
 
-## How to Run
+## Getting started
 
 ### 1. Download the model checkpoints
 
@@ -166,7 +184,7 @@ bash scripts/install.sh
 
 > **Note:** Before running the installation script, update it with the appropriate PyTorch wheel for your platform (e.g., Jetson, CUDA version, or CPU-only environment).
 
-### 3. Launch the application
+### Running FalconEye
 
 #### Gradio Interface
 

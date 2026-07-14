@@ -10,6 +10,7 @@ services:
       --port 8080
     ports:
       - "8080:8080"
+    restart: unless-stopped
 
   gradio:
     build: .
@@ -17,3 +18,4 @@ services:
     command: python app.py
     ports:
       - "7860:7860"
+    restart: unless-stopped
