@@ -4,7 +4,6 @@ Pure HTTP/WS client. Zero ML imports.
 Flow: Capture → Segment → Init Tracker → Track / Follow
 """
 
-import sys
 import gradio as gr
 import httpx
 import websockets
@@ -267,9 +266,9 @@ css = """
 .fps-display { font-size: 32px; font-weight: 600; text-align: center; padding: 6px 0; }
 """
 
-with gr.Blocks(title="FalconEye") as demo:
+with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking System") as demo:
 
-    gr.Markdown("## FalconEye\nSegment · Track · Follow")
+    gr.Markdown("## 🚀 FalconEye: A Modular Prompt-Guided Perception and Tracking System\nSegment · Track · Follow")
 
     with gr.Row(equal_height=False):
 

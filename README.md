@@ -1,183 +1,149 @@
-# 🚀 FalconEye – Prompt-Guided Intelligent Tracking Rover
+# 🚀 FalconEye
 
-FalconEye is a **product-oriented intelligent tracking system** designed for **real-time, robust object following** in dynamic environments.
-It enables users to specify a target using **clicks, reference images, or natural language**, and autonomously tracks and follows the target using a **vision–language perception pipeline**, **distractor-aware tracking**, and **closed-loop motion control** on edge hardware.
+> **A Modular Prompt-Guided Perception and Tracking System for Autonomous Following**
 
-The system is optimized for **performance, deployability, and practical usability**, making it suitable for real-world robotics applications such as:
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![Gradio](https://img.shields.io/badge/Gradio-FFB000?style=for-the-badge&logo=gradio&logoColor=black)
+![TensorRT](https://img.shields.io/badge/TensorRT-NVIDIA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
+![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-005CED?style=for-the-badge&logo=onnx&logoColor=white)
+![Jetson](https://img.shields.io/badge/NVIDIA-Jetson-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 
-- Human-following robots
-- Mobile surveillance
-- Assistive robotics
-- Smart delivery & service robots
-- Autonomous companions
+<p align="center">
+  <img src="assets/demo.gif" alt="FalconEye Demo" width="900">
+</p>
 
----
+## What is FalconEye?
 
-## ✨ Key Features
+FalconEye is a real-time visual tracking and autonomous following system.
+A user specifies a target — via a click, a reference image, or a text prompt —
+and FalconEye segments it, tracks it across frames, and generates motion commands
+to drive a rover in pursuit of that target.
 
-- **Multi-modal target specification**
-  - Click-based prompts (SAM)
-  - Reference image prompts (CLIPSeg)
-  - Natural language prompts (CLIPSeg)
+It combines promptable segmentation (SAM, CLIPSeg), single-object visual tracking
+(DaSiamRPN), and a C++ real-time motion controller, deployed end-to-end on
+Jetson AGX Xavier hardware.
 
-- **Vision–Language Object Segmentation**
-  - Open-vocabulary object grounding
-  - No task-specific retraining required
+## Why FalconEye?
 
-- **Robust Real-Time Tracking**
-  - Distractor-Aware Siamese Tracker (DaSiamRPN)
-  - Handles occlusion, clutter, and appearance changes
+Traditional visual tracking systems typically require manually initializing a tracker with a bounding box and often treat perception, tracking, and robot control as separate components.
 
-- **Closed-Loop Motion Control**
-  - Maintains target centering
-  - Regulates distance automatically
+FalconEye unifies these stages into a single end-to-end pipeline. By allowing users to specify a target through intuitive prompts—such as a click, reference image, or text description—the system bridges modern vision foundation models with autonomous robotics. Its modular design enables seamless transition from research workflows to real-time edge deployment on NVIDIA Jetson hardware.
 
-- **Edge Deployment**
-  - Runs on **Jetson AGX Xavier**
-  - ~40 FPS real-time performance
+## End-to-End Pipeline
 
-- **Product-Oriented Design**
-  - Focus on stability, responsiveness, and real-world usability
-  - Modular, scalable architecture
+<p align="center">
+    <img src="assets/pipeline.png" width="900">
+</p>
 
----
+## Features
 
-## 🧠 System Overview
+- **Multi-modal target specification** — click prompt (SAM), reference image or
+  text prompt (CLIPSeg) — no need to retrain for a new target class.
 
-FalconEye converts **user intent** into **persistent target tracking** using the following pipeline:
-<img src="assets/pipeline.png" width="700"/>
+- **Real-time single-object tracking** — DaSiamRPN-based tracker maintains lock
+  on the target across frames after initial segmentation.
 
-1. **User Prompt (Base Station)**
-   Click / Image / Text input
+- **Multi-backend inference** — runtime-selectable PyTorch, ONNX, or TensorRT,
+  chosen per deployment target (prototyping vs edge inference).
 
-2. **Object Segmentation**
-   - SAM for spatial clicks
-   - CLIPSeg for image/text prompts
+- **Full-stack pipeline** — FastAPI backend (REST + WebSocket) with a Gradio
+  web UI, service-orchestration layer, and a C++ real-time motion controller.
 
-3. **Bounding Box Initialization**
-   Mask → Bounding box
+- **Edge-deployed** — built and profiled for Jetson AGX Xavier, not just
+  desktop/cloud GPUs.
 
-4. **Visual Tracking**
-   DaSiamRPN maintains target identity
+- **Autonomous following** — segmentation + tracking output feeds directly into
+  velocity/motion command generation for closed-loop rover control.
 
-5. **Decision Module (Python)**
-   Computes steering & speed
+## 🏗️ Software Architecture
 
-6. **Motion Control (C++)**
-   Low-latency motor execution
+FalconEye adopts a layered architecture to ensure modularity, extensibility, and maintainability. The system is organized into presentation, application, AI, and hardware layers, allowing each subsystem to evolve independently while communicating through well-defined interfaces.
 
-7. **Autonomous Rover Movement**
+This design enables interchangeable perception models, multiple runtime backends (PyTorch, ONNX Runtime, TensorRT), and seamless deployment across desktop and edge hardware without modifying the higher-level application logic.
 
-The system ensures the target stays **centered in view** and at a **safe distance** during motion.
+<p align="center">
+    <img src="assets/architecture.png" width="900">
+</p>
 
----
+## System Deployment Architecture
 
-## 🏗️ Architecture
+<p align="center">
+    <img src="assets/block.png" width="900">
+</p>
 
-FalconEye uses a **distributed architecture**:
+## Key Engineering Decisions
 
-<img src="assets/architecture_diagram.png" width="700"/>
+**Dependency injection for model wrappers**
+CLIPSeg's wrapper takes a `SAMWrapper` instance via dependency injection rather than
+loading its own copy — avoids duplicate GPU memory allocation when both models are
+active in the same session.
 
+**Singleton tracker instance**
+A single global DaSiamRPN tracker instance is maintained per session instead of
+re-instantiating per frame. The ONNX-exported model bakes the template branch as a
+constant at export time (`do_constant_folding=True`), so template re-computation is
+avoided on every tracking step.
 
-### Base Station (Laptop)
-- User interface
-- Prompt input (Click / Image / Text)
-- Target specification
+**Runtime backend selection (PyTorch → ONNX → TensorRT)**
+Inference runtime is selectable rather than hardcoded, so the same codebase runs in
+PyTorch for fast iteration during development and switches to TensorRT for deployment
+on Jetson AGX Xavier, where inference latency directly bottlenecks tracking framerate.
 
-### Onboard Rover (Jetson AGX Xavier)
-- Vision–Language Segmentation
-- Visual Tracking
-- Decision Making (Python)
-- Real-Time Motor Control (C++)
+**Layered service orchestration**
+Segmentation, tracking, and following are each handled by a dedicated orchestrator
+service rather than a single monolithic handler — keeps the API layer thin and makes
+each pipeline stage independently testable.
 
-This separation allows:
-- Smooth user interaction
-- High-speed onboard processing
-- Reliable motion execution
+**Separation of Python decision logic and C++ motion control**
+High-level target state estimation and velocity computation run in Python, while the
+real-time motion controller is implemented in C++ — keeping hard real-time control
+loops out of the Python GIL's way.
 
----
+## 📂 Repository Structure
 
-## ⚙️ Hardware & Software Stack
-<img src="assets/jetson.png" width="600"/>
+```text
+FalconEye/
+├── api/                     # FastAPI application
+│   ├── main.py
+│   └── routes/              # REST API endpoints
+│       ├── segment.py
+│       ├── track.py
+│       └── follow.py
+│
+├── assets/                  # README assets
+│   ├── demo.gif
+│   ├── pipeline.png
+│   ├── architecture.png
+│   └── block.png
+│
+├── core/                    # Core AI modules
+│   ├── segmentation/         # SAM & CLIPSeg wrappers
+│   ├── tracking/             # DaSiamRPN wrapper
+│   ├── following/            # Rover controller
+│   └── utils/                # Shared utilities
+│
+├── services/                # Business logic orchestration
+│   ├── segmentation_service.py
+│   ├── tracking_service.py
+│   └── following_service.py
+│
+├── scripts/                  # Setup scripts
+│   ├── install.sh
+│   └── download_ckpt.sh
+│
+├── weights/                 # Model checkpoints
+│
+├── app.py                   # Gradio interface
+├── Dockerfile
+├── requirements.txt
+├── README.md
+└── LICENSE
+```
 
-### Hardware
-- Jetson AGX Xavier (32GB)
-- Web Camera
-- Differential Drive Rover
-- Motor Controller
+The repository follows a modular architecture that separates the presentation layer, API layer, AI inference pipeline, and motion control components. This organization enables individual perception models, tracking algorithms, and deployment backends to be developed and extended independently.
 
-### Software
-- Python (Perception & Tracking)
-- C++ (Low-level Control)
-- OpenCV
-- PyTorch
-- SAM (Segment Anything)
-- CLIPSeg
-- DaSiamRPN
-
----
-
-## 📊 Performance
-
-- **Real-time tracking:** ~40 FPS
-- **Stable under occlusion & clutter**
-- **Smooth motion control**
-- **Consistent target centering**
-- **Reliable distance regulation**
-
-The system prioritizes **responsiveness and robustness** over offline accuracy metrics, making it suitable for real-world deployment.
-
----
-
-## 🎯 Product Focus
-
-FalconEye is designed as a **performance-driven product prototype**, not just a research demo.
-
-The emphasis is on:
-
-- Real-time operation
-- Edge deployment
-- System stability
-- Practical usability
-- Modular design
-- Scalability for future features
-
-This makes FalconEye suitable for **commercial robotics use-cases** where reliability and responsiveness matter more than academic benchmarks.
-
----
-
-## 🚧 Current Capabilities
-
-- Prompt-based target selection
-- Real-time object tracking
-- Autonomous following
-- Distance control
-- Clutter & occlusion handling
-
----
-
-## 🛣️ Future Roadmap
-
-- Long-term re-identification
-- Multi-target tracking
-- LiDAR-based obstacle avoidance
-- Voice-based navigation
-- Multi-camera fusion
-- Indoor & outdoor navigation
-- Cloud-based monitoring
-
----
-
-## 📌 Use Cases
-
-- Human-following robots
-- Smart surveillance
-- Assistive mobility
-- Campus robots
-- Service robots
-- Autonomous companions
-
----
 
 
 ## How to Run
@@ -208,6 +174,14 @@ bash script/install.sh
 python app.py
 ```
 
+The Gradio interface provides three target specification modes:
+
+- 🖱️ Click Prompt
+- 🖼️ Reference Image
+- 💬 Text Prompt
+
+---
+
 #### FastAPI Server
 
 ```bash
@@ -218,17 +192,63 @@ Development Notes:
 
 Run the FastAPI server without --reload for normal usage.
 If you need auto-reload during development, use the watchfiles reloader.
-When using watchfiles, configure it to ignore large model files (such as *.onnx) to avoid unnecessary reloads.
+When using watchfiles, configure it to ignore large model files (such as *.onnx) to avoid unnecessary reloads as it is reset the tracker giving you errors.
 
 ---
 
-## 📖 References
+## 🌐 REST API
 
-- Kirillov et al., "Segment Anything", 2023
-- Lüdecke & Ecker, "CLIPSeg", CVPR 2022
-- Zhu et al., "DaSiamRPN", ECCV 2018
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/segment` | POST | Segment target using click, reference image, or text prompt |
+| `/track` | POST | Initialize or update object tracking |
+| `/follow` | POST | Generate rover motion commands |
 
----
+## ⚡ Runtime Backends
+
+FalconEye supports multiple inference runtimes through a unified abstraction layer.
+
+| Backend | Purpose |
+|---------|---------|
+| PyTorch | Development and debugging |
+| ONNX Runtime | Portable accelerated inference |
+| TensorRT | Optimized deployment on NVIDIA Jetson |
+
+## 🛣️ Roadmap
+
+- [x] Click Prompt Tracking
+- [x] Reference Image Tracking
+- [x] Text Prompt Tracking
+- [x] FastAPI Integration
+- [x] TensorRT Backend
 
 
+## 🙏 Acknowledgements
 
+FalconEye builds upon several outstanding open-source projects and research contributions. We gratefully acknowledge the authors and maintainers of:
+
+- **Segment Anything (SAM)** — Meta AI, for foundation-model-based image segmentation.
+- **CLIPSeg** — for text- and reference-image-guided segmentation.
+- **DaSiamRPN** — for robust distractor-aware Siamese object tracking.
+- **PyTorch** — for deep learning development and model execution.
+- **FastAPI** — for the REST API framework.
+- **Gradio** — for the interactive web interface.
+- **ONNX Runtime** — for portable, hardware-accelerated inference.
+- **NVIDIA TensorRT** — for optimized edge inference on Jetson platforms.
+
+Thanks to the open-source ML/CV community whose tooling made a solo, full-stack
+build like this feasible in a reasonable timeframe.
+
+## 📚 Citation
+
+If you find FalconEye useful in your research or applications, please consider citing our work.
+
+```bibtex
+@misc{falconeye2026,
+  title        = {FalconEye: A Modular Prompt-Guided Perception and Tracking System for Autonomous Following},
+  author       = {Varun Sai},
+  year         = {2026},
+  note         = {GitHub repository. Paper coming soon.},
+  howpublished = {\url{https://github.com/Varun-Sai-500/FalconEye}}
+}
+```
