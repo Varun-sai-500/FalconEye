@@ -150,10 +150,10 @@ The repository follows a modular architecture that separates the presentation la
 
 ### 1. Download the model checkpoints
 
-Run the checkpoint download script:
+Run the checkpoint download scripts:
 
 ```bash
-bash script/download_ckpt.sh
+bash scripts/download_ckpt.sh
 ```
 
 ### 2. Install the dependencies
@@ -161,7 +161,7 @@ bash script/download_ckpt.sh
 Run the installation script:
 
 ```bash
-bash script/install.sh
+bash scripts/install.sh
 ```
 
 > **Note:** Before running the installation script, update it with the appropriate PyTorch wheel for your platform (e.g., Jetson, CUDA version, or CPU-only environment).
