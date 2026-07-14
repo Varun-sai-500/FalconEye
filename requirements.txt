@@ -4,5 +4,7 @@ transformers
 opencv-python-headless
 websockets
 gradio
-onnxruntime
+onnxruntime  # onnxruntime-gpu if you're using gpu
 onnxscript
+
+#tensorrt

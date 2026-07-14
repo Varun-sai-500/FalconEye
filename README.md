@@ -31,6 +31,8 @@
 - [Roadmap](#-roadmap)
 - [Acknowledgements](#-acknowledgements)
 - [Citation](#-citation)
+- [License](#-license)
+
 
 ## What is FalconEye?
 
@@ -301,11 +303,16 @@ build like this feasible in a reasonable timeframe.
 If you find FalconEye useful in your research or applications, please consider citing our work.
 
 ```bibtex
-@misc{falconeye2026,
-  title        = {FalconEye: A Modular Prompt-Guided Perception and Tracking System for Autonomous Following},
+@misc{varunsai_falconeye_2026,
   author       = {Varun Sai},
+  title        = {FalconEye: A Modular Prompt-Guided Perception and Tracking System for Autonomous Following},
   year         = {2026},
-  note         = {GitHub repository. Paper coming soon.},
-  howpublished = {\url{https://github.com/Varun-Sai-500/FalconEye}}
+  howpublished = {\url{https://github.com/Varun-Sai-500/FalconEye}},
+  note         = {GitHub repository}
 }
 ```
+## 📄 License
+
+This project is licensed under the **Apache License 2.0**.
+
+You are free to use, modify, and distribute this software in accordance with the terms of the license. See the [LICENSE](LICENSE) file for the full license text.

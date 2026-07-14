@@ -15,3 +15,4 @@ websockets /
 onnxruntime /
 onnxscript /
 gradio
+# for running inference on tensorrt do `pip install tensorrt`
