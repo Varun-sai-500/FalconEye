@@ -1,3 +1,16 @@
+# Create a virtual environment
+python -m venv venv
+
+# Activatation
+
+# Linux / macOS
+source venv/bin/activate
+
+# Windows (PowerShell)
+# .venv\Scripts\Activate.ps1
+
+# Windows (Command Prompt)
+# .venv\Scripts\activate.bat
 
 python -m pip install --upgrade pip
 
@@ -14,5 +27,6 @@ python -m pip install \
     onnxruntime \
     onnxscript \
     gradio
-
+    
+#onnxruntime-gpu in case of GPU
 # for running inference on tensorrt do `pip install tensorrt`

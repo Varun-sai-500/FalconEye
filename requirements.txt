@@ -4,7 +4,11 @@ transformers
 opencv-python-headless
 websockets
 gradio
-onnxruntime  # onnxruntime-gpu if you're using gpu
+onnxruntime
 onnxscript
 
-#tensorrt
+# If using GPU, replace onnxruntime with:
+# onnxruntime-gpu
+#
+# TensorRT (optional, NVIDIA only):
+# pip install tensorrt
