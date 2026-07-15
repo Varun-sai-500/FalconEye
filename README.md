@@ -170,11 +170,7 @@ The repository follows a modular architecture that separates the presentation la
 
 ### 1. Download the model checkpoints
 
-Run the checkpoint download scripts:
-
-```bash
-bash scripts/download_ckpt.sh
-```
+Download the recommended DaSiamRPN OTB checkpoint from the latest GitHub Release and place it in the weights/ directory.
 
 ### 2. Install the dependencies
 
