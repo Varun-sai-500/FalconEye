@@ -9,7 +9,7 @@ def create_tracker() -> DaSiamRPNTracker:
     """
     global _tracker
 
-    _tracker = DaSiamRPNTracker(model_path="weights/SiamRPNVOT.model")
+    _tracker = DaSiamRPNTracker(model_path="weights/SiamRPNOTB.model")
     return _tracker
 
 

@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 
-from core.utils.net import SiamRPNvot
+from core.utils.net import SiamRPNotb
 from core.utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
 from core.utils.utilities import cxy_wh_2_rect
 
@@ -61,7 +61,6 @@ def trt_infer(context, x_crop):
 # ---------------------------------------------------------------
 class _ONNXNet:
     """
-    Drop-in for SiamRPNvot.
     temple() is a no-op — real kernels already baked into the graph.
     """
     def __init__(self, onnx_path):
@@ -95,7 +94,6 @@ class _ONNXNet:
 # ---------------------------------------------------------------
 class _TRTNet:
     """
-    Drop-in for SiamRPNvot.
     temple() is a no-op — kernels baked into the engine at build time.
     """
     def __init__(self, engine_path):
@@ -132,7 +130,7 @@ class DaSiamRPNTracker:
     Backend priority: TensorRT → ONNX → PyTorch.
     """
     def __init__(self,
-                 model_path: str = 'models/SiamRPNVOT.model',
+                 model_path: str = 'models/SiamRPNOTB.model',
                  onnx_path:  str = 'weights/search.onnx',
                  trt_path:   str = 'weights/search.engine',
                  use_onnx:   bool = True):
@@ -158,7 +156,7 @@ class DaSiamRPNTracker:
         )
 
         # PyTorch net always loaded — needed for temple() during init_from_mask()
-        self.pt_net = SiamRPNvot()
+        self.pt_net = SiamRPNotb()
         self.pt_net.load_state_dict(torch.load(model_path, map_location=self.device))
         self.pt_net.eval().to(self.device)
         print(f"[INFO] PyTorch model loaded | device: {self.device}")
