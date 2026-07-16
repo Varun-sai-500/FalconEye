@@ -1,9 +1,7 @@
-version: "3.9"
-
 services:
   api:
+    image: falconeye:latest
     build: .
-    container_name: falconeye-api
     command: >
       uvicorn api.main:app
       --host 0.0.0.0
@@ -11,11 +9,12 @@ services:
     ports:
       - "8080:8080"
     restart: unless-stopped
+    gpus: all
 
   gradio:
-    build: .
-    container_name: falconeye-gradio
+    image: falconeye:latest
     command: python app.py
     ports:
       - "7860:7860"
     restart: unless-stopped
+    gpus: all

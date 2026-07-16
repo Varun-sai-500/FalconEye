@@ -1,0 +1,8 @@
+torch
+torchvision
+transformers
+opencv-python-headless
+websockets
+gradio
+onnxruntime
+onnxscript
