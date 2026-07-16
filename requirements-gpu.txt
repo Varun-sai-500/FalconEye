@@ -1,4 +1,4 @@
-# install torch version according to your machine
+# install torch and torchvision according to your machine
 transformers
 opencv-python-headless
 websockets
