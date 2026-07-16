@@ -149,15 +149,14 @@ FalconEye/
 │   ├── tracking_service.py
 │   └── following_service.py
 │
-├── scripts/                  # Setup scripts
-│   ├── install.sh
-│   └── download_ckpt.sh
-│
 ├── weights/                 # Model checkpoints
 │
 ├── app.py                   # Gradio interface
 ├── Dockerfile
-├── requirements.txt
+├── docker-compose.ghcr.yml  # for deployment
+├── docker-compose.yml       # for end users to build/develop
+├── requirements-cpu.txt
+├── requirements-gpu.txt
 ├── README.md
 └── LICENSE
 ```
@@ -172,48 +171,93 @@ The repository follows a modular architecture that separates the presentation la
 
 Download the recommended DaSiamRPN OTB checkpoint from the latest GitHub Release and place it in the weights/ directory.
 
+
 ### 2. Install the dependencies
 
-Run the installation script:
+#### CPU Installation
+
+Create and activate a virtual environment:
 
 ```bash
-bash scripts/install.sh
+python -m venv venv
 ```
 
-> **Note:** Before running the installation script, update it with the appropriate PyTorch wheel for your platform (e.g., Jetson, CUDA version, or CPU-only environment).
+**Linux / macOS**
 
-### Running FalconEye
+```bash
+source venv/bin/activate
+```
 
-#### Gradio Interface
+**Windows (PowerShell)**
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+**Windows (Command Prompt)**
+
+```cmd
+venv\Scripts\activate.bat
+```
+
+Upgrade pip:
+
+```bash
+python -m pip install --upgrade pip
+```
+
+Install the appropriate PyTorch build for your platform:
+
+https://pytorch.org/get-started/locally/
+
+Then install the FalconEye dependencies:
+
+```bash
+python -m pip install -r requirements-cpu.txt
+```
+
+---
+
+#### GPU Installation (Native)
+
+Create and activate a virtual environment as above.
+
+Install the appropriate CUDA-compatible PyTorch build for your system:
+
+https://pytorch.org/get-started/locally/
+
+Then install the GPU dependencies:
+
+```bash
+python -m pip install -r requirements-gpu.txt
+```
+## Running FalconEye
+
+### Gradio Interface
 
 ```bash
 python app.py
 ```
 
-The Gradio interface provides three target specification modes:
-
-- 🖱️ Click Prompt
-- 🖼️ Reference Image
-- 💬 Text Prompt
-
----
-
-#### FastAPI Server
+### FastAPI Server
 
 ```bash
 uvicorn api.main:app --host 0.0.0.0 --port 8080
 ```
 
-Development Notes:
-
-Run the FastAPI server without --reload for normal usage.
-If you need auto-reload during development, use the watchfiles reloader.
-When using watchfiles, configure it to ignore large model files (such as *.onnx) to avoid unnecessary reloads as it is reset the tracker giving you errors.
-
 ---
-## 🐳 Docker
+# 🐳 Docker (Recommended for GPU)
 
-FalconEye provides a single Docker image that contains the complete application stack, including all models, dependencies, and shared modules.
+FalconEye provides a prebuilt GPU Docker image through GitHub Container Registry (GHCR).
+
+The image contains the complete application stack, including:
+
+- PyTorch
+- TensorRT
+- ONNX Runtime GPU
+- FastAPI
+- Gradio
+- All FalconEye modules and dependencies
 
 Using Docker Compose, two independent services are launched from the same image:
 
@@ -228,14 +272,36 @@ Using Docker Compose, two independent services are launched from the same image:
 ```
 
 - **FastAPI (`api/main.py`)** exposes REST endpoints for segmentation, tracking, and following.
-- **Gradio (`app.py`)** provides an interactive web interface for experimentation and demonstrations.
+- **Gradio (`app.py`)** provides an interactive web interface.
 - Both services share the same codebase, models, and weights while running as independent containers.
 
-### Build and Run
+---
+
+## Option 1: Run the Prebuilt Image (Recommended)
+
+Pull the latest FalconEye image:
+
+```bash
+docker pull ghcr.io/varun-sai-500/falconeye:latest
+```
+
+Start the application:
+
+```bash
+docker compose -f docker-compose.ghcr.yml up
+```
+
+---
+
+## Option 2: Build from Source
+
+Build the image locally:
 
 ```bash
 docker compose up --build
 ```
+
+---
 
 After startup:
 
@@ -277,6 +343,10 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 - [x] FastAPI Integration
 - [x] TensorRT Backend
 
+- [ ] Clean separation of 3 backend into separate file
+- [ ] Single Synchronization point for tracker
+- [ ] Future Re-Identification case - SAM usage when confidence drops
+- [ ] PID for movements
 
 ## 🙏 Acknowledgements
 
