@@ -169,7 +169,7 @@ The repository follows a modular architecture that separates the presentation la
 
 ### 1. Download the model checkpoints
 
-Download the recommended DaSiamRPN OTB checkpoint from the latest GitHub Release and place it in the weights/ directory.
+Download the recommended DaSiamRPN OTB checkpoint from the **latest GitHub Release** and place it in the weights/ directory.
 
 
 ### 2. Install the dependencies
@@ -205,12 +205,6 @@ Upgrade pip:
 ```bash
 python -m pip install --upgrade pip
 ```
-
-Install the appropriate PyTorch build for your platform:
-
-https://pytorch.org/get-started/locally/
-
-Then install the FalconEye dependencies:
 
 ```bash
 python -m pip install -r requirements-cpu.txt
@@ -279,12 +273,6 @@ Using Docker Compose, two independent services are launched from the same image:
 
 ## Option 1: Run the Prebuilt Image (Recommended)
 
-Pull the latest FalconEye image:
-
-```bash
-docker pull ghcr.io/varun-sai-500/falconeye:latest
-```
-
 Start the application:
 
 ```bash
@@ -343,7 +331,7 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 - [x] ONNXRuntime Backend
 - [x] TensorRT Backend
 
-- [ ] Single Synchronization point for tracker
+- [ ] Single Synchronization point for tracker 
 - [ ] Future Re-Identification case - SAM usage when confidence drops
 - [ ] Improve Tracker - use dasiamrpn's outputs
 

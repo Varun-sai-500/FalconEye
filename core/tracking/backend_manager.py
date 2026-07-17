@@ -221,7 +221,7 @@ class BackendManager:
 
         builder = trt.Builder(logger)
         EXPLICIT_BATCH = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        network = builder.create_network()
+        network = builder.create_network(EXPLICIT_BATCH)
         parser = trt.OnnxParser(network, logger)
 
         with open(self.onnx_path, "rb") as f:
@@ -231,6 +231,9 @@ class BackendManager:
                 raise RuntimeError("ONNX parse failed")
 
         config = builder.create_builder_config()
+        # Without an explicit workspace limit, build_serialized_network can
+        # silently return None on some TRT versions/GPUs instead of raising.
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1 GiB
 
         serialized_engine = builder.build_serialized_network(
             network,
