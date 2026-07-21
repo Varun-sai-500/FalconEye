@@ -1,5 +1,6 @@
 import time
 import numpy as np
+import torch
 
 from core.utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
 from core.utils.utilities import cxy_wh_2_rect
@@ -13,30 +14,26 @@ class DaSiamRPNTracker:
     track_live() is available for local webcam/file playback with cv2 display.
     One instance = one tracking session.
 
-    All model loading, ONNX export, and TensorRT build/backend-selection logic
-    lives in BackendManager — this class only tracks.
+    Frames arrive as numpy BGR (from cv2/FastAPI upload) and are converted to a
+    CUDA float32 tensor exactly once per call, at the top of init_from_mask/track_step.
+    Everything downstream (run_SiamRPN.py) operates on that tensor with a single
+    .cpu() sync per frame, inside tracker_eval.
     """
+
     def __init__(self,
                  model_path: str = 'models/SiamRPNOTB.model',
                  onnx_path:  str = 'weights/search.onnx',
                  trt_path:   str = 'weights/search.engine',
                  use_onnx:   bool = True,
                  backend_manager: BackendManager = None):
-        """
-        Args:
-            model_path, onnx_path, trt_path, use_onnx : forwarded to BackendManager
-                if backend_manager isn't supplied directly.
-            backend_manager : optionally inject an existing BackendManager
-                (e.g. to share one across multiple tracker sessions).
-        """
         self.backend = backend_manager or BackendManager(
             model_path=model_path,
             onnx_path=onnx_path,
             trt_path=trt_path,
             use_onnx=use_onnx,
         )
+        self.device = self.backend.device
 
-        # tracking state
         self.state           = None
         self.last_good_state = None
         self.score_ema       = None
@@ -45,7 +42,6 @@ class DaSiamRPNTracker:
         self.alpha_fps       = 0.9
         self.last_tracking_fps = 0.0
 
-        # thresholds (instance attrs so FastAPI callers can override per-session)
         self.CONF_THRESH = 0.35
         self.MAX_LOST    = 15
         self.lost_count  = 0
@@ -61,19 +57,34 @@ class DaSiamRPNTracker:
         self.fps_ema = None
         self.lost_count = 0
 
+    def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
+        """The ONE H2D copy per frame. Everything downstream reuses this tensor."""
+        return torch.from_numpy(frame).to(self.device, non_blocking=True).float()
+
+    @staticmethod
+    def _clone_state(state: dict) -> dict:
+        """
+        dict.copy() is shallow — fine for scalars/config objects that are never
+        mutated in place, but target_pos/target_sz get REASSIGNED (not
+        mutated) every SiamRPN_track call, so aliasing the tensor reference here
+        is safe. Being explicit about it rather than relying on that as an
+        accident: we .clone() the two tensors that matter so last_good_state
+        can never be silently affected by a future in-place edit to state.
+        """
+        new_state = state.copy()
+        new_state['target_pos'] = state['target_pos'].clone()
+        new_state['target_sz'] = state['target_sz'].clone()
+        if "r1_kernel" in state:
+            new_state["r1_kernel"] = state["r1_kernel"].clone()
+
+        if "cls1_kernel" in state:
+            new_state["cls1_kernel"] = state["cls1_kernel"].clone()
+        return new_state
+
     # -----------------------------------------------------------
     # INIT FROM MASK
     # -----------------------------------------------------------
     def init_from_mask(self, frame: np.ndarray, mask: np.ndarray) -> tuple:
-        """
-        Initialise tracker from a segmentation mask.
-
-        Args:
-            frame : HxWxC numpy BGR
-            mask  : HxW binary (255 or True = object pixels)
-        Returns:
-            (x_min, y_min, w, h)
-        """
         if frame is None or mask is None:
             raise ValueError("frame and mask are required")
 
@@ -88,18 +99,15 @@ class DaSiamRPNTracker:
         cx = x_min + w / 2
         cy = y_min + h / 2
 
-        target_pos = np.array([cx, cy])
-        target_sz  = np.array([w,  h])
+        target_pos = [cx, cy]   # plain python list — SiamRPN_init expects this now
+        target_sz  = [w, h]
 
-        # SiamRPN_init calls pt_net.temple(real_z_crop) internally —
-        # r1_kernel / cls1_kernel are REAL after this line
-        self.state           = SiamRPN_init(frame, target_pos, target_sz, self.backend.get_pt_net())
-        self.last_good_state = self.state.copy()
+        im_t = self._frame_to_gpu(frame)
+        self.state           = SiamRPN_init(im_t, target_pos, target_sz, self.backend.get_pt_net())
+        self.last_good_state = self._clone_state(self.state)
         self.score_ema       = None
         self.lost_count      = 0
-
-        # export NOW — kernels are real at this exact point. No-op if already done.
-        self.backend.export_and_build()
+        self.backend.export_and_build(self.state["r1_kernel"], self.state["cls1_kernel"])
 
         print(f"[INFO] Tracker initialised | box: ({x_min},{y_min},{w},{h})")
         return (x_min, y_min, w, h)
@@ -107,15 +115,18 @@ class DaSiamRPNTracker:
     # -----------------------------------------------------------
     # TRACK STEP  (FastAPI / per-frame API)
     # -----------------------------------------------------------
+
     def track_step(self, frame: np.ndarray) -> dict:
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_step()")
 
         active_net, backend = self.backend.active_net
-
         self.state["net"] = active_net
+
+        im_t = self._frame_to_gpu(frame)
+
         t0 = time.perf_counter()
-        self.state = SiamRPN_track(self.state, frame)
+        self.state = SiamRPN_track(self.state, im_t)
         self.last_tracking_fps = 1.0 / (time.perf_counter() - t0)
 
         raw_score = float(self.state.get("score", 1.0))
@@ -130,12 +141,12 @@ class DaSiamRPNTracker:
 
         H, W = frame.shape[:2]
 
+        # state['target_pos'] / state['target_sz'] are CUDA tensors —
+        # cxy_wh_2_rect returns a (4,) CUDA tensor, .tolist() is the sync
+        # point here (small, 4 floats, negligible vs. the model's own .cpu())
         x, y, w, h = map(
             int,
-            cxy_wh_2_rect(
-                self.state["target_pos"],
-                self.state["target_sz"],
-            ),
+            cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
         )
 
         x = max(0, min(x, W - w))
@@ -144,27 +155,22 @@ class DaSiamRPNTracker:
         if weak:
             self.lost_count += 1
             if self.last_good_state is not None:
-                self.state = self.last_good_state.copy()
+                self.state = self._clone_state(self.last_good_state)
                 x, y, w, h = map(
                     int,
-                    cxy_wh_2_rect(
-                        self.state["target_pos"],
-                        self.state["target_sz"],
-                    ),
+                    cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
                 )
         else:
             self.lost_count = 0
-            self.last_good_state = self.state.copy()
+            self.last_good_state = self._clone_state(self.state)
 
         lost = self.lost_count >= self.MAX_LOST
 
         fps_inst = self.last_tracking_fps
-
         self.fps_ema = (
             fps_inst
             if self.fps_ema is None
-            else self.alpha_fps * self.fps_ema
-            + (1 - self.alpha_fps) * fps_inst
+            else self.alpha_fps * self.fps_ema + (1 - self.alpha_fps) * fps_inst
         )
 
         return {
@@ -180,15 +186,6 @@ class DaSiamRPNTracker:
     # TRACK LIVE  (local display / debug)
     # -----------------------------------------------------------
     def track_live(self, video_src=0, display: bool = True):
-        """
-        Convenience generator for local webcam or file playback.
-        Calls track_step() internally — no duplicated logic.
-        Yields the track_step() dict each frame, or None when lost.
-
-        Args:
-            video_src : cv2.VideoCapture source (int or path)
-            display   : draw bbox + HUD via cv2.imshow
-        """
         import cv2
 
         if self.state is None:
@@ -211,7 +208,7 @@ class DaSiamRPNTracker:
                     break
 
                 frame = cv2.resize(frame, (SCREEN_W, SCREEN_H))
-                result = self.track_step(frame)
+                result = self.track_step(frame)  # numpy in, GPU tensor conversion happens inside
 
                 bbox    = result["bbox"]
                 score   = result["score"]
