@@ -20,7 +20,7 @@ router = APIRouter()
 # Globals
 # ----------------------------------------------------------------------
 
-active_tracking_task: asyncio.Task | None = None
+
 tracking_lock = asyncio.Lock()
 
 
@@ -67,64 +67,48 @@ async def init_track(file: UploadFile, mask_b64: str = Form(...)):
     return InitTrackResponse(bbox=list(bbox))
 
 
-# ----------------------------------------------------------------------
-# Live Tracking
-# ----------------------------------------------------------------------
+connection_lock = asyncio.Lock()
+active_tracking_task: asyncio.Task | None = None
+generation = 0
 
 @router.websocket("/track/live")
 async def track_live(websocket: WebSocket):
-    global active_tracking_task
+    global active_tracking_task, generation
 
-    #
-    # Kill any stale websocket loop (Gradio reconnect / proxy restart)
-    #
-    if (
-        active_tracking_task is not None
-        and not active_tracking_task.done()
-    ):
-        print("[WARN] Existing tracking loop detected. Cancelling...")
+    async with connection_lock:
+        if active_tracking_task is not None and not active_tracking_task.done():
+            active_tracking_task.cancel()
+            try:
+                await active_tracking_task
+            except asyncio.CancelledError:
+                pass
 
-        active_tracking_task.cancel()
+        await websocket.accept()
 
-        try:
-            await active_tracking_task
-        except asyncio.CancelledError:
-            pass
+        tracker = get_tracker()
+        if not tracker.initialized:
+            await websocket.send_json({"error": "tracker not initialized"})
+            await websocket.close()
+            return
 
-        active_tracking_task = None
+        generation += 1
+        my_gen = generation
+        current_task = asyncio.current_task()
+        active_tracking_task = current_task
 
-    await websocket.accept()
-
-    tracker = get_tracker()
-
-    if not tracker.initialized:
-        await websocket.send_json(
-            {"error": "tracker not initialized"}
-        )
-        await websocket.close()
-        return
-
-    current_task = asyncio.current_task()
-    active_tracking_task = current_task
-
-    print("[INFO] Live tracking websocket connected.")
-
+    # ... loop body unchanged, but guard writes to shared state:
     try:
         while True:
             data = await websocket.receive_bytes()
-
             frame = decode_image(data)
-
             if frame is None:
-                await websocket.send_json(
-                    {"error": "decode_image returned None"}
-                )
+                await websocket.send_json({"error": "decode_image returned None"})
                 continue
 
-            #
-            # Only one inference at a time
-            #
             async with tracking_lock:
+                if my_gen != generation:
+                    # someone superseded us between recv and lock acquisition
+                    break
                 result = tracker.track_step(frame)
 
             await websocket.send_json({
@@ -135,25 +119,10 @@ async def track_live(websocket: WebSocket):
                 "tracker_fps": result["tracker_fps"],
                 "backend": result["backend"],
             })
-
-    except WebSocketDisconnect as e:
-        if e.code == 1012:
-            print("[WARN] Client disconnected (1012 Service Restart)")
-        else:
-            print(f"[INFO] Client disconnected ({e.code})")
-
-    except asyncio.CancelledError:
-        print("[INFO] Tracking task cancelled.")
-        raise
-
-    except Exception as e:
-        print(f"[ERROR] Live tracking failed: {e}")
-
     finally:
-        if active_tracking_task is current_task:
-            active_tracking_task = None
-
-        print("[INFO] Tracking loop cleaned up.")
+        async with connection_lock:
+            if active_tracking_task is current_task:
+                active_tracking_task = None
 
 
 @router.post("/track/debug")
