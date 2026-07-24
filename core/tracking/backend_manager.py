@@ -27,17 +27,13 @@ TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
 class TRTNet:
     def __init__(self, engine_path, score_size, anchor_num, logger=None):
         self.logger = logger if logger is not None else trt.Logger(trt.Logger.WARNING)
-        self.stream = torch.cuda.current_stream()
+        self.stream = torch.cuda.Stream()
 
         self.engine = self._load_engine(engine_path)
         self.context = self.engine.create_execution_context()
 
         self.score_size = score_size
         self.anchor_num = anchor_num
-        self.last_model_fps = 0.0
-
-        self._evt_start = torch.cuda.Event(enable_timing=True)
-        self._evt_end = torch.cuda.Event(enable_timing=True)
 
         self.regression_buf = torch.empty(
             (1, 4 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=torch.float32
@@ -70,23 +66,16 @@ class TRTNet:
         r1_kernel = r1_kernel.contiguous().float()
         cls1_kernel = cls1_kernel.contiguous().float()
 
-        self._evt_start.record(self.stream)
+        # Make TRT's stream wait for the preprocessing ops above (which ran
+        # on the caller's current stream) before it starts reading the tensors
+        self.stream.wait_stream(torch.cuda.current_stream())
         self.context.set_tensor_address("search_crop", x_crop.data_ptr())
         self.context.set_tensor_address("r1_kernel", r1_kernel.data_ptr())
         self.context.set_tensor_address("cls1_kernel", cls1_kernel.data_ptr())
         self.context.set_tensor_address("regression", self.regression_buf.data_ptr())
         self.context.set_tensor_address("classification", self.classification_buf.data_ptr())
-
-        self.context.execute_async_v3(self.stream.cuda_stream)
-        self._evt_end.record(self.stream)
-
-        # Immediate sync to catch exact execution duration for this specific frame
-        self._evt_end.synchronize()
-        elapsed_ms = self._evt_start.elapsed_time(self._evt_end)
-        self.last_model_fps = 1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0
-
+        self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
         return self.regression_buf, self.classification_buf
-
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
         return self.forward(x_crop, r1_kernel, cls1_kernel)
 
@@ -128,7 +117,6 @@ class TRTNet:
 
 class ONNXNet:
     def __init__(self, onnx_path, device=None):
-        self.last_model_fps = 0.0
         self.device = device or torch.device('cpu')
         providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
                      if ORT_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers()
@@ -183,16 +171,9 @@ class ONNXNet:
             for name in self.output_names:
                 self.io_binding.bind_output(name, device_type='cuda', device_id=x_crop.device.index or 0)
 
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-            t0 = time.perf_counter()
-
             self.session.run_with_iobinding(self.io_binding)
 
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-            dt = time.perf_counter() - t0
-            self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
+
 
             outs = self.io_binding.get_outputs()
             regression = torch.utils.dlpack.from_dlpack(outs[0].to_dlpack()) if hasattr(outs[0], "to_dlpack") \
@@ -200,7 +181,6 @@ class ONNXNet:
             classification = torch.utils.dlpack.from_dlpack(outs[1].to_dlpack()) if hasattr(outs[1], "to_dlpack") \
                 else torch.as_tensor(outs[1].numpy(), device=self.device)
         else:
-            t0 = time.perf_counter()
             x_np = x_crop.cpu().numpy()
             r1_np = r1_kernel.cpu().numpy()
             cls1_np = cls1_kernel.cpu().numpy()
@@ -208,36 +188,11 @@ class ONNXNet:
             feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
             regression, classification = self.session.run(None, feeds)
 
-            dt = time.perf_counter() - t0
-            self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
 
             regression = torch.from_numpy(regression).to(self.device)
             classification = torch.from_numpy(classification).to(self.device)
 
         return regression, classification
-
-
-class TimedTorchNet:
-    def __init__(self, net, device):
-        self.net = net
-        self.device = device
-        self.last_model_fps = 0.0
-
-    def __call__(self, *args, **kwargs):
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-        out = self.net(*args, **kwargs)
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-        self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
-        return out
-
-    def __getattr__(self, name):
-        return getattr(self.net, name)
 
 
 class BackendManager:
@@ -280,7 +235,6 @@ class BackendManager:
 
         self.onnx_net = None
         self.trt_net  = None
-        self.pt_net_timed = TimedTorchNet(self.pt_net, self.device)
 
     @property
     def active_net(self):
@@ -288,7 +242,7 @@ class BackendManager:
             return self.trt_net, "TensorRT"
         if self.onnx_net is not None:
             return self.onnx_net, "ONNX"
-        return self.pt_net_timed, "PyTorch"
+        return self.pt_net, "PyTorch"
 
     def get_pt_net(self):
         return self.pt_net
