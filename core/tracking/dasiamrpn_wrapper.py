@@ -1,5 +1,6 @@
 import time
 import numpy as np
+import cv2
 import torch
 
 from core.utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
@@ -58,8 +59,10 @@ class DaSiamRPNTracker:
         self.lost_count = 0
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
+        cpu_tensor = torch.from_numpy(frame).float()
+        pinned_tensor = cpu_tensor.pin_memory()
         """The ONE H2D copy per frame. Everything downstream reuses this tensor."""
-        return torch.from_numpy(frame).to(self.device, non_blocking=True).float()
+        return pinned_tensor.to(self.device, non_blocking=True)
 
     @staticmethod
     def _clone_state(state: dict) -> dict:
@@ -119,17 +122,22 @@ class DaSiamRPNTracker:
     def track_step(self, frame: np.ndarray) -> dict:
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_step()")
-
+        t0 = time.perf_counter()
         active_net, backend = self.backend.active_net
         self.state["net"] = active_net
 
         im_t = self._frame_to_gpu(frame)
 
-        t0 = time.perf_counter()
         self.state = SiamRPN_track(self.state, im_t)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
         self.last_tracking_fps = 1.0 / (time.perf_counter() - t0)
-
         raw_score = float(self.state.get("score", 1.0))
+
+        # 1. Safely handle NaN scores
+        if np.isnan(raw_score):
+            raw_score = 0.0
+
         self.score_ema = (
             raw_score
             if self.score_ema is None
@@ -137,13 +145,23 @@ class DaSiamRPNTracker:
         )
 
         score = self.score_ema
-        weak = score < self.CONF_THRESH
+
+        # 2. Check if the output bounding boxes contain any NaN values
+        coords_nan = torch.isnan(self.state["target_pos"]).any() or torch.isnan(self.state["target_sz"]).any()
+        weak = (score < self.CONF_THRESH) or coords_nan
 
         H, W = frame.shape[:2]
 
-        # state['target_pos'] / state['target_sz'] are CUDA tensors —
-        # cxy_wh_2_rect returns a (4,) CUDA tensor, .tolist() is the sync
-        # point here (small, 4 floats, negligible vs. the model's own .cpu())
+        # 3. INTERCEPT AND ROLLBACK BEFORE CONVERTING TO INT
+        if weak:
+            self.lost_count += 1
+            if self.last_good_state is not None:
+                self.state = self._clone_state(self.last_good_state)
+        else:
+            self.lost_count = 0
+            self.last_good_state = self._clone_state(self.state)
+
+        # 4. Now mapping to integer is safe because NaN states have been reverted
         x, y, w, h = map(
             int,
             cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
@@ -151,18 +169,6 @@ class DaSiamRPNTracker:
 
         x = max(0, min(x, W - w))
         y = max(0, min(y, H - h))
-
-        if weak:
-            self.lost_count += 1
-            if self.last_good_state is not None:
-                self.state = self._clone_state(self.last_good_state)
-                x, y, w, h = map(
-                    int,
-                    cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
-                )
-        else:
-            self.lost_count = 0
-            self.last_good_state = self._clone_state(self.state)
 
         lost = self.lost_count >= self.MAX_LOST
 
@@ -177,7 +183,7 @@ class DaSiamRPNTracker:
             "bbox": (x, y, w, h),
             "score": float(score),
             "lost": lost,
-            "fps": float(self.fps_ema),
+            "tracker_fps": float(self.fps_ema),
             "model_fps": float(getattr(active_net, "last_model_fps", 0.0)),
             "backend": backend,
         }
@@ -185,9 +191,8 @@ class DaSiamRPNTracker:
     # -----------------------------------------------------------
     # TRACK LIVE  (local display / debug)
     # -----------------------------------------------------------
-    def track_live(self, video_src=0, display: bool = True):
-        import cv2
 
+    def track_live(self, video_src=0, display: bool = True):
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_live()")
 
@@ -210,12 +215,12 @@ class DaSiamRPNTracker:
                 frame = cv2.resize(frame, (SCREEN_W, SCREEN_H))
                 result = self.track_step(frame)  # numpy in, GPU tensor conversion happens inside
 
-                bbox    = result["bbox"]
-                score   = result["score"]
-                lost    = result["lost"]
-                fps     = result["fps"]
-                mfps    = result["model_fps"]
-                label   = result["backend"]
+                bbox         = result["bbox"]
+                score        = result["score"]
+                lost         = result["lost"]
+                tracker_fps  = result["tracker_fps"]
+                model_fps    = result["model_fps"]
+                label         = result["backend"]
                 x, y, w, h = bbox
 
                 if display:
@@ -228,7 +233,7 @@ class DaSiamRPNTracker:
                     )
                     cv2.putText(
                         frame,
-                        f"{label} | E2E:{int(fps)} | Model:{int(mfps)} | S:{score:.2f}",
+                        f"{label} | Tracker:{int(tracker_fps)} | Model:{int(model_fps)} | S:{score:.2f}",
                         (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.65,
@@ -237,8 +242,8 @@ class DaSiamRPNTracker:
                     )
                     cv2.imshow("DaSiamRPN", frame)
 
-                if cv2.waitKey(1) & 0xFF in [ord('q'), ord('Q')]:
-                    break
+                    if cv2.waitKey(1) & 0xFF in [ord('q'), ord('Q')]:
+                        break
 
                 yield None if lost else result
         finally:
