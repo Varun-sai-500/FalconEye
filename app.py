@@ -243,22 +243,20 @@ def push_live_frame(rgb_np):
             pass
     live_frame_queue.put(frame_bgr)
 
+_ws_thread_lock = threading.Lock()
+_ws_thread_handle = None
 def _ws_thread(mode):
-    """Runs in background thread — reads frames pushed in from the browser
-    webcam (via live_frame_queue) and streams them to the backend WS with auto-reconnect."""
+    global _ws_thread_handle
 
     async def run():
-        reconnect_delay = 1.0  # Cooldown time before retrying a 1012 loop drop
-
+        reconnect_delay = 1.0
         while not state["stop_flag"]:
             try:
                 print(f"[INFO] Connecting to tracking WebSocket at {WS_BASE}/track/live...")
                 async with websockets.connect(f"{WS_BASE}/track/live") as ws:
                     state["ws_error"] = None
-
                     while not state["stop_flag"]:
                         try:
-                            # Use a non-blocking queue fetch with a small timeout to stay responsive to stop_flags
                             frame = live_frame_queue.get(timeout=0.1)
                         except Empty:
                             continue
@@ -269,22 +267,19 @@ def _ws_thread(mode):
                             await ws.send(jpg)
                             raw = await ws.recv()
                         except websockets.ConnectionClosed as cc:
-                            # Catch the 1012 restart explicitly
                             if cc.code == 1012:
-                                print(f"[WARN] WebSocket encountered 1012 (Service Restart). Initiating smooth cooling reconnect...")
+                                print("[WARN] WebSocket encountered 1012 (Service Restart). Reconnecting...")
                             else:
                                 print(f"[WARN] WebSocket connection broken (Code: {cc.code}). Retrying...")
-                            raise  # Break inner loop to trigger outer while-loop reconnect sequence
+                            raise
 
                         result = json.loads(raw)
-
                         if "error" in result:
                             state["ws_error"] = result["error"]
                             break
 
                         if result_queue.full():
                             result_queue.get_nowait()
-
                         result_queue.put((frame, result))
                         state["ws_error"] = None
 
@@ -299,24 +294,21 @@ def _ws_thread(mode):
             except (websockets.ConnectionClosed, OSError, Exception) as e:
                 state["ws_error"] = f"Connection split: {str(e)}. Re-establishing loop context..."
                 print(f"[WARN] Streaming heartbeat interrupted: {e}")
-
-                # Critical step: Sleep to give the FastAPI backend a clear
-                # window to completely unmount its active task and drop GPU locks
                 await asyncio.sleep(reconnect_delay)
-                continue  # Retry connection loop gracefully
+                continue
 
-        # Loop terminated via intentional stop_flag
-        state["tracking"] = False
-        print("[INFO] Background inference client thread destroyed safely.")
-
-    asyncio.run(run())
+    with _ws_thread_lock:
+        if _ws_thread_handle is not None and _ws_thread_handle.is_alive():
+            state["stop_flag"] = True
+            _ws_thread_handle.join(timeout=2)
+        state["stop_flag"] = False
+        _ws_thread_handle = threading.Thread(target=lambda: asyncio.run(run()), daemon=True)
+        _ws_thread_handle.start()
 
 def _start_and_poll(mode):
     state["stop_flag"]  = False
     state["tracking"]   = True
-
-    t = threading.Thread(target=_ws_thread, args=(mode,), daemon=True)
-    t.start()
+    _ws_thread(mode)
 
     while state["tracking"] or not result_queue.empty():
         if state["ws_error"]:
@@ -455,17 +447,12 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
                 track_init_status = gr.HTML('<p class="status-txt"></p>')
 
                 with gr.Column(visible=False) as live_group:
-                    with gr.Row():
-                        track_btn  = gr.Button("Track",  variant="primary")
-                        follow_btn = gr.Button("Follow", variant="primary")
-                        stop_btn   = gr.Button("Stop",   variant="stop")
-
-                    gr.HTML(
-                        '<p class="status-txt">Press the button below to start live feed, then click Track or Follow. </p>'
-                    )
                     # This is the ONLY thing that keeps the browser camera alive
                     # during Track/Follow. It streams frames straight into
                     # push_live_frame() via .stream() below
+                    gr.HTML(
+                        '<p class="status-txt">Press the button below to start live feed, then click Track or Follow. </p>'
+                    )
                     live_webcam = gr.Image(
                         label="Live Camera",
                         sources=["webcam"],
@@ -473,6 +460,12 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
                         type="numpy",
                         height=160,
                     )
+                    with gr.Row():
+                        track_btn  = gr.Button("Track",  variant="primary")
+                        follow_btn = gr.Button("Follow", variant="primary")
+                        stop_btn   = gr.Button("Stop",   variant="stop")
+
+
 
     # ── Wiring ────────────────────────────────────────────────
 
