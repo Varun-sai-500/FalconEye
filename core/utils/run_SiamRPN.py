@@ -1,42 +1,6 @@
 import torch
 import torch.nn.functional as F
-from .utilities import SubwindowCropper, cxy_wh_2_rect
-
-
-def generate_anchor_torch(total_stride, scales, ratios, score_size, device="cuda"):
-    anchor_num = len(ratios) * len(scales)
-    score_size = int(score_size)
-
-    ratios_t = torch.tensor(ratios, dtype=torch.float32, device=device)
-    scales_t = torch.tensor(scales, dtype=torch.float32, device=device)
-
-    size = total_stride * total_stride
-
-    ws = torch.sqrt(size / ratios_t).int().float()
-    hs = (ws * ratios_t).int().float()
-
-    wws = (ws.unsqueeze(1) * scales_t).flatten()
-    hhs = (hs.unsqueeze(1) * scales_t).flatten()
-
-    base_anchors = torch.stack([
-        torch.zeros_like(wws),
-        torch.zeros_like(hhs),
-        wws,
-        hhs
-    ], dim=-1)  # (anchor_num, 4)
-
-    ori = -(score_size / 2.0) * total_stride
-    grid_linear = torch.arange(score_size, dtype=torch.float32, device=device) * total_stride + ori
-    yy, xx = torch.meshgrid(grid_linear, grid_linear, indexing='ij')
-
-    xx = xx.flatten().repeat(anchor_num)
-    yy = yy.flatten().repeat(anchor_num)
-    anchors = base_anchors.repeat_interleave(score_size * score_size, dim=0)
-    anchors[:, 0] = xx
-    anchors[:, 1] = yy
-
-    return anchors
-
+from .utilities import SubwindowCropper, generate_anchors
 
 class TrackerConfig(object):
     windowing = 'cosine'
@@ -119,7 +83,7 @@ def SiamRPN_init(im, target_pos, target_sz, net):
             p.instance_size = 271
         p.score_size = (p.instance_size - p.exemplar_size) // p.total_stride + 1
 
-    p.anchor = generate_anchor_torch(p.total_stride, p.scales, p.ratios, int(p.score_size), device=device)
+    p.anchor = generate_anchors(p.total_stride, p.scales, p.ratios, int(p.score_size), device=device)
 
     avg_chans = im.mean(dim=(0, 1))
 
