@@ -152,6 +152,11 @@ def on_image_click(np_img, method, click_points_state, evt: gr.SelectData):
     return vis, json.dumps(click_points_state), click_points_state
 
 def clear_clicks(np_img):
+    # Grab the clean frame without circles, if it exists
+    if state["last_frame_bgr"] is not None:
+        clean_rgb = cv2.cvtColor(state["last_frame_bgr"], cv2.COLOR_BGR2RGB)
+        return clean_rgb, "[]", []
+
     return np_img, "[]", []
 
 # ── Step 2: Segment ───────────────────────────────────────────
@@ -240,41 +245,69 @@ def push_live_frame(rgb_np):
 
 def _ws_thread(mode):
     """Runs in background thread — reads frames pushed in from the browser
-    webcam (via live_frame_queue) and streams them to the backend WS."""
+    webcam (via live_frame_queue) and streams them to the backend WS with auto-reconnect."""
+
     async def run():
-        try:
-            async with websockets.connect(f"{WS_BASE}/track/live") as ws:
-                while not state["stop_flag"]:
-                    try:
-                        frame = live_frame_queue.get(timeout=1.0)
-                    except Empty:
-                        continue
+        reconnect_delay = 1.0  # Cooldown time before retrying a 1012 loop drop
 
-                    jpg = numpy_to_bytes(frame)
-                    await ws.send(jpg)
-                    raw = await ws.recv()
-                    result = json.loads(raw)
-
-                    if "error" in result:
-                        state["ws_error"] = result["error"]
-                        break
-                    if result_queue.full():
-                        result_queue.get_nowait()
-
-                    result_queue.put((frame, result))
+        while not state["stop_flag"]:
+            try:
+                print(f"[INFO] Connecting to tracking WebSocket at {WS_BASE}/track/live...")
+                async with websockets.connect(f"{WS_BASE}/track/live") as ws:
                     state["ws_error"] = None
 
-                    if mode == "follow" and not result.get("lost"):
+                    while not state["stop_flag"]:
                         try:
-                            if follow_queue.full():
-                                follow_queue.get_nowait()
-                            follow_queue.put(result["bbox"])
-                        except Exception as e:
-                            print(e)
-        except Exception as e:
-            state["ws_error"] = str(e)
-        finally:
-            state["tracking"] = False
+                            # Use a non-blocking queue fetch with a small timeout to stay responsive to stop_flags
+                            frame = live_frame_queue.get(timeout=0.1)
+                        except Empty:
+                            continue
+
+                        jpg = numpy_to_bytes(frame)
+
+                        try:
+                            await ws.send(jpg)
+                            raw = await ws.recv()
+                        except websockets.ConnectionClosed as cc:
+                            # Catch the 1012 restart explicitly
+                            if cc.code == 1012:
+                                print(f"[WARN] WebSocket encountered 1012 (Service Restart). Initiating smooth cooling reconnect...")
+                            else:
+                                print(f"[WARN] WebSocket connection broken (Code: {cc.code}). Retrying...")
+                            raise  # Break inner loop to trigger outer while-loop reconnect sequence
+
+                        result = json.loads(raw)
+
+                        if "error" in result:
+                            state["ws_error"] = result["error"]
+                            break
+
+                        if result_queue.full():
+                            result_queue.get_nowait()
+
+                        result_queue.put((frame, result))
+                        state["ws_error"] = None
+
+                        if mode == "follow" and not result.get("lost"):
+                            try:
+                                if follow_queue.full():
+                                    follow_queue.get_nowait()
+                                follow_queue.put(result["bbox"])
+                            except Exception as e:
+                                print(f"[ERR] Follow queue update failure: {e}")
+
+            except (websockets.ConnectionClosed, OSError, Exception) as e:
+                state["ws_error"] = f"Connection split: {str(e)}. Re-establishing loop context..."
+                print(f"[WARN] Streaming heartbeat interrupted: {e}")
+
+                # Critical step: Sleep to give the FastAPI backend a clear
+                # window to completely unmount its active task and drop GPU locks
+                await asyncio.sleep(reconnect_delay)
+                continue  # Retry connection loop gracefully
+
+        # Loop terminated via intentional stop_flag
+        state["tracking"] = False
+        print("[INFO] Background inference client thread destroyed safely.")
 
     asyncio.run(run())
 
@@ -374,7 +407,7 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
             input_frame = gr.Image(
                 label="Captured frame (click here to mark segmentation points)",
                 type="numpy",
-                interactive=True,
+                interactive=False,
                 sources=[],
             )
             capture_status = gr.HTML('<p class="status-txt"></p>')
@@ -432,7 +465,7 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
                     )
                     # This is the ONLY thing that keeps the browser camera alive
                     # during Track/Follow. It streams frames straight into
-                    # push_live_frame() via .stream() below 
+                    # push_live_frame() via .stream() below
                     live_webcam = gr.Image(
                         label="Live Camera",
                         sources=["webcam"],
@@ -512,4 +545,4 @@ if __name__ == "__main__":
         target=follow_worker,
         daemon=True,
     ).start()
-    demo.launch(css=css, theme=gr.themes.Soft(), server_port=7860)
+    demo.launch(css=css, theme=gr.themes.Soft(), server_name = "0.0.0.0", server_port=7860, share=True)
