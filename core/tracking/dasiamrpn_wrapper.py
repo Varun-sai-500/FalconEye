@@ -32,6 +32,7 @@ class DaSiamRPNTracker:
             onnx_path=onnx_path,
             trt_path=trt_path,
             use_onnx=use_onnx,
+            benchmark=True
         )
         self.device = self.backend.device
 
@@ -191,7 +192,7 @@ class DaSiamRPNTracker:
             "score": float(score),
             "lost": lost,
             "tracker_fps": float(self.fps_ema),
-            "model_fps": float(getattr(active_net, "last_model_fps", 0.0)),
+            "model_fps": float(self.backend.model_fps),
             "backend": backend,
         }
 
