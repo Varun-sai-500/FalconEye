@@ -1,7 +1,10 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile, Form
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile, Form, File
 from pydantic import BaseModel
+import asyncio
 import base64
 import cv2
+import tempfile
+import shutil
 import numpy as np
 
 from services.tracking_service import (
@@ -13,9 +16,25 @@ from services.tracking_service import (
 router = APIRouter()
 
 
+# ----------------------------------------------------------------------
+# Globals
+# ----------------------------------------------------------------------
+
+active_tracking_task: asyncio.Task | None = None
+tracking_lock = asyncio.Lock()
+
+
+# ----------------------------------------------------------------------
+# Models
+# ----------------------------------------------------------------------
+
 class InitTrackResponse(BaseModel):
     bbox: list[int]
 
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 
 def decode_image(file_bytes: bytes) -> np.ndarray:
     return cv2.imdecode(
@@ -32,6 +51,10 @@ def decode_mask_b64(mask_b64: str) -> np.ndarray:
     )
 
 
+# ----------------------------------------------------------------------
+# Init
+# ----------------------------------------------------------------------
+
 @router.post("/track/init", response_model=InitTrackResponse)
 async def init_track(file: UploadFile, mask_b64: str = Form(...)):
     tracker = create_tracker()
@@ -43,8 +66,33 @@ async def init_track(file: UploadFile, mask_b64: str = Form(...)):
 
     return InitTrackResponse(bbox=list(bbox))
 
+
+# ----------------------------------------------------------------------
+# Live Tracking
+# ----------------------------------------------------------------------
+
 @router.websocket("/track/live")
 async def track_live(websocket: WebSocket):
+    global active_tracking_task
+
+    #
+    # Kill any stale websocket loop (Gradio reconnect / proxy restart)
+    #
+    if (
+        active_tracking_task is not None
+        and not active_tracking_task.done()
+    ):
+        print("[WARN] Existing tracking loop detected. Cancelling...")
+
+        active_tracking_task.cancel()
+
+        try:
+            await active_tracking_task
+        except asyncio.CancelledError:
+            pass
+
+        active_tracking_task = None
+
     await websocket.accept()
 
     tracker = get_tracker()
@@ -55,6 +103,11 @@ async def track_live(websocket: WebSocket):
         )
         await websocket.close()
         return
+
+    current_task = asyncio.current_task()
+    active_tracking_task = current_task
+
+    print("[INFO] Live tracking websocket connected.")
 
     try:
         while True:
@@ -68,7 +121,11 @@ async def track_live(websocket: WebSocket):
                 )
                 continue
 
-            result = tracker.track_step(frame)
+            #
+            # Only one inference at a time
+            #
+            async with tracking_lock:
+                result = tracker.track_step(frame)
 
             await websocket.send_json({
                 "bbox": result["bbox"],
@@ -78,10 +135,47 @@ async def track_live(websocket: WebSocket):
                 "tracker_fps": result["tracker_fps"],
                 "backend": result["backend"],
             })
-    except WebSocketDisconnect:
+
+    except WebSocketDisconnect as e:
+        if e.code == 1012:
+            print("[WARN] Client disconnected (1012 Service Restart)")
+        else:
+            print(f"[INFO] Client disconnected ({e.code})")
+
+    except asyncio.CancelledError:
+        print("[INFO] Tracking task cancelled.")
+        raise
+
+    except Exception as e:
+        print(f"[ERROR] Live tracking failed: {e}")
+
+    finally:
+        if active_tracking_task is current_task:
+            active_tracking_task = None
+
+        print("[INFO] Tracking loop cleaned up.")
+
+
+@router.post("/track/debug")
+async def debug(video: UploadFile = File(...)):
+    tracker = get_tracker()
+
+    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as tmp:
+        shutil.copyfileobj(video.file, tmp)
+        video_path = tmp.name
+
+    for _ in tracker.track_live(video_path, display=False):
         pass
+
+    return {"status": "done"}
+
+# ----------------------------------------------------------------------
+# Reset
+# ----------------------------------------------------------------------
 
 @router.post("/track/reset")
 def reset():
     reset_tracker()
-    return {"status": "tracker reset"}
+    return {
+        "status": "tracker reset"
+    }
