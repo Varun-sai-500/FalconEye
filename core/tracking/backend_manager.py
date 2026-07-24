@@ -16,91 +16,117 @@ except ImportError:
 
 try:
     import tensorrt as trt
-    TRT_AVAILABLE = True
-    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    TRT_INSTALLED = True
 except ImportError:
-    TRT_AVAILABLE = False
-    print("[WARN] tensorrt not installed — TRT backend disabled")
+    TRT_INSTALLED = False
+
+CUDA_AVAILABLE = torch.cuda.is_available()
+TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
 
 
-# ---------------------------------------------------------------
-# TRT HELPERS
-# ---------------------------------------------------------------
-def load_engine(engine_path):
-    if not TRT_AVAILABLE:
-        raise RuntimeError("TensorRT not installed")
-    runtime = trt.Runtime(TRT_LOGGER)
-    with open(engine_path, "rb") as f:
-        engine_data = f.read()
-    return runtime.deserialize_cuda_engine(engine_data)
+class TRTNet:
+    def __init__(self, engine_path, score_size, anchor_num, logger=None):
+        self.logger = logger if logger is not None else trt.Logger(trt.Logger.WARNING)
+        self.stream = torch.cuda.current_stream()
 
-
-def trt_infer(context, x_crop, r1_kernel, cls1_kernel, regression_buf, classification_buf):
-    if isinstance(x_crop, np.ndarray):
-        x_crop = torch.from_numpy(x_crop).cuda()
-
-    x_crop = x_crop.contiguous().float()
-    if not x_crop.is_cuda:
-        x_crop = x_crop.cuda()
-
-    # Zero Host-to-Device / Device-to-Host overhead via static GPU virtual address pointers
-    context.set_tensor_address("search_crop", x_crop.data_ptr())
-    context.set_tensor_address("r1_kernel", r1_kernel.data_ptr())
-    context.set_tensor_address("cls1_kernel", cls1_kernel.data_ptr())
-    context.set_tensor_address("regression", regression_buf.data_ptr())
-    context.set_tensor_address("classification", classification_buf.data_ptr())
-
-    context.execute_async_v3(torch.cuda.current_stream().cuda_stream)
-
-    return regression_buf, classification_buf
-
-
-class _TRTNet:
-    def __init__(self, engine_path, score_size, anchor_num):
-        if not TRT_AVAILABLE:
-            raise RuntimeError("TensorRT not installed — cannot load engine")
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA not available — cannot run TRT engine")
-
-        self.engine  = load_engine(engine_path)
+        self.engine = self._load_engine(engine_path)
         self.context = self.engine.create_execution_context()
-        self.last_model_fps = 0.0
 
         self.score_size = score_size
         self.anchor_num = anchor_num
+        self.last_model_fps = 0.0
 
-        # Pre-allocated permanent tracking buffers (Avoids runtime frame-by-frame memory pooling spikes)
+        self._evt_start = torch.cuda.Event(enable_timing=True)
+        self._evt_end = torch.cuda.Event(enable_timing=True)
+
         self.regression_buf = torch.empty(
-            (1, 4 * anchor_num, score_size, score_size), device="cuda", dtype=torch.float32
+            (1, 4 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=torch.float32
         )
         self.classification_buf = torch.empty(
-            (1, 2 * anchor_num, score_size, score_size), device="cuda", dtype=torch.float32
+            (1, 2 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=torch.float32
         )
-        print(f"[INFO] TRT engine initialized | score_size={score_size}")
+        print(f"[INFO] TRT engine initialized successfully | score_size={score_size}")
+
+    def _load_engine(self, engine_path):
+        runtime = trt.Runtime(self.logger)
+        if not os.path.exists(engine_path):
+            raise FileNotFoundError(f"TensorRT engine not found at: {engine_path}")
+
+        with open(engine_path, "rb") as f:
+            engine_data = f.read()
+        engine = runtime.deserialize_cuda_engine(engine_data)
+        if engine is None:
+            raise RuntimeError("Failed to deserialize TensorRT engine.")
+        return engine
+
+    @torch.inference_mode()
+    def forward(self, x_crop, r1_kernel, cls1_kernel):
+        device = self.regression_buf.device
+        if x_crop.device != device: x_crop = x_crop.to(device, non_blocking=True)
+        if r1_kernel.device != device: r1_kernel = r1_kernel.to(device, non_blocking=True)
+        if cls1_kernel.device != device: cls1_kernel = cls1_kernel.to(device, non_blocking=True)
+
+        x_crop = x_crop.contiguous().float()
+        r1_kernel = r1_kernel.contiguous().float()
+        cls1_kernel = cls1_kernel.contiguous().float()
+
+        self._evt_start.record(self.stream)
+        self.context.set_tensor_address("search_crop", x_crop.data_ptr())
+        self.context.set_tensor_address("r1_kernel", r1_kernel.data_ptr())
+        self.context.set_tensor_address("cls1_kernel", cls1_kernel.data_ptr())
+        self.context.set_tensor_address("regression", self.regression_buf.data_ptr())
+        self.context.set_tensor_address("classification", self.classification_buf.data_ptr())
+
+        self.context.execute_async_v3(self.stream.cuda_stream)
+        self._evt_end.record(self.stream)
+
+        # Immediate sync to catch exact execution duration for this specific frame
+        self._evt_end.synchronize()
+        elapsed_ms = self._evt_start.elapsed_time(self._evt_end)
+        self.last_model_fps = 1000.0 / elapsed_ms if elapsed_ms > 0 else 0.0
+
+        return self.regression_buf, self.classification_buf
 
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
-        t0 = time.perf_counter()
-        regression, classification = trt_infer(
-            self.context,
-            x_crop,
-            r1_kernel,
-            cls1_kernel,
-            self.regression_buf,
-            self.classification_buf
-        )
-        self.last_model_fps = 1.0 / (time.perf_counter() - t0)
-        return regression, classification
+        return self.forward(x_crop, r1_kernel, cls1_kernel)
 
-    def temple(self, z):
-        pass
+    @staticmethod
+    def build_trt_engine(onnx_path, trt_path, workspace_size=1 << 30):
+        print(f"[INFO] Executing offline local TensorRT serialization engine compilation...")
+        logger = trt.Logger(trt.Logger.INFO)
+        builder = trt.Builder(logger)
 
-    cfg = {}
+        if hasattr(trt.NetworkDefinitionCreationFlag, 'EXPLICIT_BATCH'):
+            flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            network = builder.create_network(flags)
+        else:
+            network = builder.create_network()
+
+        parser = trt.OnnxParser(network, logger)
+        if not parser.parse_from_file(onnx_path):
+            for i in range(parser.num_errors):
+                print(f"[ONNX Parser Error]: {parser.get_error(i)}")
+            raise RuntimeError("ONNX Parser parsing integrity failure.")
+
+        config = builder.create_builder_config()
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            raise RuntimeError("TensorRT compilation interface returned null pointer.")
+
+        trt_dir = os.path.dirname(trt_path)
+        if trt_dir:
+            os.makedirs(trt_dir, exist_ok=True)
+
+        tmp_path = trt_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(serialized_engine)
+        os.replace(tmp_path, trt_path)
+        print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{trt_path}'")
 
 
-# ---------------------------------------------------------------
-# ZERO-COPY ONNX RUNTIME INTERFACE (VIA IO-BINDING MAPPING)
-# ---------------------------------------------------------------
-class _ONNXNet:
+class ONNXNet:
     def __init__(self, onnx_path, device=None):
         self.last_model_fps = 0.0
         self.device = device or torch.device('cpu')
@@ -137,14 +163,15 @@ class _ONNXNet:
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
         if not torch.is_tensor(x_crop):
             x_crop = torch.from_numpy(x_crop).to(self.device)
-        x_crop = x_crop.contiguous().float()
-
-        t0 = time.perf_counter()
 
         if self.using_cuda:
-            x_crop = x_crop.to(self.device, non_blocking=True)
-            r1_kernel = r1_kernel.to(self.device, non_blocking=True)
-            cls1_kernel = cls1_kernel.to(self.device, non_blocking=True)
+            if x_crop.device != self.device: x_crop = x_crop.to(self.device, non_blocking=True)
+            if r1_kernel.device != self.device: r1_kernel = r1_kernel.to(self.device, non_blocking=True)
+            if cls1_kernel.device != self.device: cls1_kernel = cls1_kernel.to(self.device, non_blocking=True)
+
+            x_crop = x_crop.contiguous().float()
+            r1_kernel = r1_kernel.contiguous().float()
+            cls1_kernel = cls1_kernel.contiguous().float()
 
             self.io_binding.clear_binding_inputs()
             self.io_binding.clear_binding_outputs()
@@ -156,35 +183,63 @@ class _ONNXNet:
             for name in self.output_names:
                 self.io_binding.bind_output(name, device_type='cuda', device_id=x_crop.device.index or 0)
 
-            self.session.run_with_iobinding(self.io_binding)
-            outs = self.io_binding.get_outputs()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
 
+            self.session.run_with_iobinding(self.io_binding)
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
+
+            outs = self.io_binding.get_outputs()
             regression = torch.utils.dlpack.from_dlpack(outs[0].to_dlpack()) if hasattr(outs[0], "to_dlpack") \
                 else torch.as_tensor(outs[0].numpy(), device=self.device)
             classification = torch.utils.dlpack.from_dlpack(outs[1].to_dlpack()) if hasattr(outs[1], "to_dlpack") \
                 else torch.as_tensor(outs[1].numpy(), device=self.device)
         else:
+            t0 = time.perf_counter()
             x_np = x_crop.cpu().numpy()
             r1_np = r1_kernel.cpu().numpy()
             cls1_np = cls1_kernel.cpu().numpy()
 
             feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
             regression, classification = self.session.run(None, feeds)
+
+            dt = time.perf_counter() - t0
+            self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
+
             regression = torch.from_numpy(regression).to(self.device)
             classification = torch.from_numpy(classification).to(self.device)
 
-        self.last_model_fps = 1.0 / (time.perf_counter() - t0)
         return regression, classification
 
-    def temple(self, z):
-        pass
 
-    cfg = {}
+class TimedTorchNet:
+    def __init__(self, net, device):
+        self.net = net
+        self.device = device
+        self.last_model_fps = 0.0
+
+    def __call__(self, *args, **kwargs):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        out = self.net(*args, **kwargs)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        self.last_model_fps = 1.0 / dt if dt > 0 else 0.0
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self.net, name)
 
 
-# ---------------------------------------------------------------
-# UNIFIED COMPILATION & BACKEND ARCHITECTURE LIFE-CYCLE MANAGER
-# ---------------------------------------------------------------
 class BackendManager:
     def __init__(self,
                  model_path: str = 'models/SiamRPNOTB.model',
@@ -192,10 +247,13 @@ class BackendManager:
                  trt_path:   str = 'weights/search.engine',
                  use_onnx:   bool = True,
                  instance_size: int = 271,
+                 custom_stride_calc: bool = False,
                  exemplar_size: int = 127,
                  total_stride: int = 8,
                  anchor_num: int = 5,
-                 device=None):
+                 device=None,
+                 benchmark: bool = False):
+
         self.model_path = model_path
         self.onnx_path  = onnx_path
         self.trt_path   = trt_path
@@ -206,14 +264,14 @@ class BackendManager:
         self.exemplar_size = exemplar_size
         self.score_size = (instance_size - exemplar_size) // total_stride + 1
         self.anchor_num = anchor_num
+        self.benchmark = benchmark
 
         self.device = device or torch.device(
-            'cuda' if torch.cuda.is_available()
+            'cuda:0' if torch.cuda.is_available()
             else 'mps' if torch.backends.mps.is_available()
             else 'cpu'
         )
 
-        # Baseline PyTorch initialization path
         self.pt_net = SiamRPNotb()
         if os.path.exists(model_path):
             self.pt_net.load_state_dict(torch.load(model_path, map_location=self.device))
@@ -222,15 +280,15 @@ class BackendManager:
 
         self.onnx_net = None
         self.trt_net  = None
+        self.pt_net_timed = TimedTorchNet(self.pt_net, self.device)
 
     @property
     def active_net(self):
-        """Returns the absolute highest-priority ready acceleration backend."""
         if self.trt_net is not None:
             return self.trt_net, "TensorRT"
         if self.onnx_net is not None:
             return self.onnx_net, "ONNX"
-        return self.pt_net, "PyTorch"
+        return self.pt_net_timed, "PyTorch"
 
     def get_pt_net(self):
         return self.pt_net
@@ -238,23 +296,22 @@ class BackendManager:
     def export_and_build(self, r1_kernel, cls1_kernel):
         assert r1_kernel.device == self.device
         assert cls1_kernel.device == self.device
-        """
-        Traces and saves the structural execution graph using the real tracking kernels
-        computed directly from Frame 0. Eliminates dummy image generation bottlenecks entirely.
-        """
+
         if not self.use_onnx or self.onnx_net is not None:
             return
 
         print(f"[INFO] Exporting search.onnx using real frame-0 target context tensors...")
         dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
 
-        with torch.no_grad():
-            os.makedirs(os.path.dirname(self.onnx_path), exist_ok=True)
-
+        with torch.inference_mode():
+            onnx_dir = os.path.dirname(self.onnx_path)
+            if onnx_dir:
+                os.makedirs(onnx_dir, exist_ok=True)
             torch.onnx.export(
                 self.pt_net,
                 (dummy_x, r1_kernel, cls1_kernel),
                 self.onnx_path,
+                export_params=True,
                 input_names=["search_crop", "r1_kernel", "cls1_kernel"],
                 output_names=["regression", "classification"],
                 opset_version=18,
@@ -264,47 +321,54 @@ class BackendManager:
 
         if TRT_AVAILABLE and not os.path.exists(self.trt_path):
             try:
-                self._build_trt_engine()
+                print("[WARN] Compiling TensorRT runtime workspace engine. This will block network threads...")
+                TRTNet.build_trt_engine(self.onnx_path, self.trt_path)
             except Exception as e:
                 print(f"[WARN] TensorRT automatic compilation aborted: {e}")
 
-        self.onnx_net = _ONNXNet(self.onnx_path, device=self.device)
+        self.onnx_net = ONNXNet(self.onnx_path, device=self.device)
 
-        if self.use_trt:
+        if self.use_trt and os.path.exists(self.trt_path):
             try:
-                self.trt_net = _TRTNet(self.trt_path, self.score_size, self.anchor_num)
+                self.trt_net = TRTNet(
+                    engine_path=self.trt_path,
+                    score_size=self.score_size,
+                    anchor_num=self.anchor_num
+                )
             except Exception as e:
-                print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX runtime engine.")
+                print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
                 self.trt_net = None
 
-    def _build_trt_engine(self):
-        if not TRT_AVAILABLE:
-            raise RuntimeError("TensorRT backend driver unavailable.")
+        if self.benchmark:
+            self.run_benchmark(dummy_x, r1_kernel, cls1_kernel)
 
-        print(f"[INFO] Executing offline local TensorRT serialization engine compilation...")
-        logger = trt.Logger(trt.Logger.INFO)
-        builder = trt.Builder(logger)
-        EXPLICIT_BATCH = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        network = builder.create_network(EXPLICIT_BATCH)
-        parser = trt.OnnxParser(network, logger)
+    def run_benchmark(self, x_crop, r1_kernel, cls1_kernel, iterations=300, warmup=30):
+        net, name = self.active_net
+        print(f"\n[BENCHMARK] Starting isolation sweep for active backend: {name}...")
 
-        with open(self.onnx_path, "rb") as f:
-            if not parser.parse(f.read()):
-                for i in range(parser.num_errors):
-                    print(parser.get_error(i))
-                raise RuntimeError("ONNX Parser parsing integrity failure.")
+        for _ in range(warmup):
+            _, _ = net(x_crop, r1_kernel, cls1_kernel)
 
-        config = builder.create_builder_config()
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # Allocates exactly 1 GiB memory pool window
+        if self.device.type == "cuda": torch.cuda.synchronize()
 
-        serialized_engine = builder.build_serialized_network(network, config)
-        if serialized_engine is None:
-            raise RuntimeError("TensorRT compilation interface returned null pointer.")
+        latencies = []
+        for _ in range(iterations):
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _, _ = net(x_crop, r1_kernel, cls1_kernel)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            latencies.append((time.perf_counter() - t0) * 1000.0)
 
-        os.makedirs(os.path.dirname(self.trt_path), exist_ok=True)
-        tmp_path = self.trt_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(serialized_engine)
-        os.replace(tmp_path, self.trt_path)
+        avg_latency = np.mean(latencies)
+        p99_latency = np.percentile(latencies, 99)
+        fps = 1000.0 / avg_latency if avg_latency > 0 else 0.0
 
-        print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{self.trt_path}'")
+        print(f"\n" + "="*60)
+        print(f" BENCHMARK RUNTIME REPORT: {name.upper()}")
+        print("="*60)
+        print(f" * Achievable Frames/Sec : {fps:.2f} FPS")
+        print(f" * Avg Engine Latency   : {avg_latency:.3f} ms")
+        print(f" * P99 Tail Latency     : {p99_latency:.3f} ms")
+        print("="*60 + "\n")
