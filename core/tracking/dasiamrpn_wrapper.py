@@ -59,10 +59,17 @@ class DaSiamRPNTracker:
         self.lost_count = 0
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
+        # 1. Convert numpy array to torch tensor
         cpu_tensor = torch.from_numpy(frame).float()
-        pinned_tensor = cpu_tensor.pin_memory()
-        """The ONE H2D copy per frame. Everything downstream reuses this tensor."""
-        return pinned_tensor.to(self.device, non_blocking=True)
+
+        # 2. Check if the target device is a GPU (CUDA/MPS)
+        if self.device.type != "cpu":
+            # Pin memory ONLY if an accelerator is actually available
+            pinned_tensor = cpu_tensor.pin_memory()
+            return pinned_tensor.to(self.device, non_blocking=True)
+
+        # 3. Fallback safely if running on pure CPU
+        return cpu_tensor.to(self.device)
 
     @staticmethod
     def _clone_state(state: dict) -> dict:
@@ -192,7 +199,10 @@ class DaSiamRPNTracker:
     # TRACK LIVE  (local display / debug)
     # -----------------------------------------------------------
 
-    def track_live(self, video_src=0, display: bool = True):
+    def track_live(self, video_src="input.mov", display: bool = False):
+        tracker_fps_sum = 0.0
+        model_fps_sum = 0.0
+        frames = 0
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_live()")
 
@@ -214,6 +224,9 @@ class DaSiamRPNTracker:
 
                 frame = cv2.resize(frame, (SCREEN_W, SCREEN_H))
                 result = self.track_step(frame)  # numpy in, GPU tensor conversion happens inside
+                tracker_fps_sum += result["tracker_fps"]
+                model_fps_sum += result["model_fps"]
+                frames += 1
 
                 bbox         = result["bbox"]
                 score        = result["score"]
@@ -248,4 +261,17 @@ class DaSiamRPNTracker:
                 yield None if lost else result
         finally:
             cap.release()
-            cv2.destroyAllWindows()
+
+            if frames:
+                print("=" * 50)
+                print(f"Frames processed : {frames}")
+                print(f"Average Tracker FPS : {tracker_fps_sum / frames:.2f}")
+                print(f"Average Model FPS   : {model_fps_sum / frames:.2f}")
+                print("=" * 50)
+
+            if display:
+                try:
+                    cv2.destroyAllWindows()
+                except cv2.error:
+                    pass
+
