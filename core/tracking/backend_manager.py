@@ -19,6 +19,7 @@ try:
     TRT_INSTALLED = True
 except ImportError:
     TRT_INSTALLED = False
+    print("[WARN] tensorrt not installed.")
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
@@ -66,7 +67,6 @@ class TRTNet:
         r1_kernel = r1_kernel.contiguous().float()
         cls1_kernel = cls1_kernel.contiguous().float()
 
-        # Make TRT's stream wait for the preprocessing ops above (which ran
         # on the caller's current stream) before it starts reading the tensors
         self.stream.wait_stream(torch.cuda.current_stream())
         self.context.set_tensor_address("search_crop", x_crop.data_ptr())
@@ -219,6 +219,7 @@ class BackendManager:
         self.exemplar_size = exemplar_size
         self.score_size = (instance_size - exemplar_size) // total_stride + 1
         self.anchor_num = anchor_num
+        self.model_fps = 0.0
         self.benchmark = benchmark
 
         self.device = device or torch.device(
@@ -250,50 +251,48 @@ class BackendManager:
     def export_and_build(self, r1_kernel, cls1_kernel):
         assert r1_kernel.device == self.device
         assert cls1_kernel.device == self.device
+        if self.use_onnx and self.onnx_net is None:
+            print(f"[INFO] Exporting search.onnx using real frame-0 target context tensors...")
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
 
-        if not self.use_onnx or self.onnx_net is not None:
-            return
-
-        print(f"[INFO] Exporting search.onnx using real frame-0 target context tensors...")
-        dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
-
-        with torch.inference_mode():
-            onnx_dir = os.path.dirname(self.onnx_path)
-            if onnx_dir:
-                os.makedirs(onnx_dir, exist_ok=True)
-            torch.onnx.export(
-                self.pt_net,
-                (dummy_x, r1_kernel, cls1_kernel),
-                self.onnx_path,
-                export_params=True,
-                input_names=["search_crop", "r1_kernel", "cls1_kernel"],
-                output_names=["regression", "classification"],
-                opset_version=18,
-                do_constant_folding=True,
-            )
-        print(f"[INFO] Structural trace completed → saved to '{self.onnx_path}'")
-
-        if TRT_AVAILABLE and not os.path.exists(self.trt_path):
-            try:
-                print("[WARN] Compiling TensorRT runtime workspace engine. This will block network threads...")
-                TRTNet.build_trt_engine(self.onnx_path, self.trt_path)
-            except Exception as e:
-                print(f"[WARN] TensorRT automatic compilation aborted: {e}")
-
-        self.onnx_net = ONNXNet(self.onnx_path, device=self.device)
-
-        if self.use_trt and os.path.exists(self.trt_path):
-            try:
-                self.trt_net = TRTNet(
-                    engine_path=self.trt_path,
-                    score_size=self.score_size,
-                    anchor_num=self.anchor_num
+            with torch.inference_mode():
+                onnx_dir = os.path.dirname(self.onnx_path)
+                if onnx_dir:
+                    os.makedirs(onnx_dir, exist_ok=True)
+                torch.onnx.export(
+                    self.pt_net,
+                    (dummy_x, r1_kernel, cls1_kernel),
+                    self.onnx_path,
+                    export_params=True,
+                    input_names=["search_crop", "r1_kernel", "cls1_kernel"],
+                    output_names=["regression", "classification"],
+                    opset_version=18,
+                    do_constant_folding=True,
                 )
-            except Exception as e:
-                print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
-                self.trt_net = None
+            print(f"[INFO] Structural trace completed → saved to '{self.onnx_path}'")
 
+            if TRT_AVAILABLE and not os.path.exists(self.trt_path):
+                try:
+                    print("[WARN] Compiling TensorRT runtime workspace engine. This will block network threads...")
+                    TRTNet.build_trt_engine(self.onnx_path, self.trt_path)
+                except Exception as e:
+                    print(f"[WARN] TensorRT automatic compilation aborted: {e}")
+
+            self.onnx_net = ONNXNet(self.onnx_path, device=self.device)
+
+            if self.use_trt and os.path.exists(self.trt_path):
+                try:
+                    self.trt_net = TRTNet(
+                        engine_path=self.trt_path,
+                        score_size=self.score_size,
+                        anchor_num=self.anchor_num
+                    )
+                except Exception as e:
+                    print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
+                    self.trt_net = None
         if self.benchmark:
+            # Re-create dummy_x safely here in case the ONNX block above was skipped
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
             self.run_benchmark(dummy_x, r1_kernel, cls1_kernel)
 
     def run_benchmark(self, x_crop, r1_kernel, cls1_kernel, iterations=300, warmup=30):
@@ -318,11 +317,11 @@ class BackendManager:
         avg_latency = np.mean(latencies)
         p99_latency = np.percentile(latencies, 99)
         fps = 1000.0 / avg_latency if avg_latency > 0 else 0.0
-
+        self.model_fps = fps
         print(f"\n" + "="*60)
         print(f" BENCHMARK RUNTIME REPORT: {name.upper()}")
         print("="*60)
-        print(f" * Achievable Frames/Sec : {fps:.2f} FPS")
+        print(f" * end-to-end callable FPS : {fps:.2f} FPS")
         print(f" * Avg Engine Latency   : {avg_latency:.3f} ms")
         print(f" * P99 Tail Latency     : {p99_latency:.3f} ms")
         print("="*60 + "\n")
