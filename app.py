@@ -14,7 +14,7 @@ import base64
 import json
 import threading
 import time
-from queue import Queue
+from queue import Queue, Empty
 
 from core.utils.image_preprocessing import pil_to_bgr, bgr_to_pil
 
@@ -25,13 +25,13 @@ state = {
     "mask_b64":       None,
     "last_frame_bgr": None,   # captured frame, used for segment + track init
     "stop_flag":      False,
-    "ws_result":      None,
     "ws_error":       None,
     "tracking":       False,
 }
-result_queue = Queue(maxsize=1)
-follow_queue = Queue(maxsize=1)
-api_client = httpx.Client(timeout=30)
+result_queue     = Queue(maxsize=1)
+follow_queue     = Queue(maxsize=1)
+live_frame_queue = Queue(maxsize=1)   # frames streamed in from the browser webcam
+api_client    = httpx.Client(timeout=30)
 follow_client = httpx.Client(timeout=0.05)
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -50,16 +50,68 @@ def overlay_mask(frame_bgr, mask):
     green[mask > 127] = [0, 200, 0]
     return cv2.addWeighted(green, 0.45, out, 0.55, 0)
 
-def draw_bbox(frame_bgr, bbox, score=None, lost=False):
+def draw_bbox(
+    frame_bgr,
+    bbox,
+    backend=None,
+    model_fps=None,
+    tracker_fps=None,
+    score=None,
+    lost=False,
+):
     x, y, w, h = [int(v) for v in bbox]
+
     out = frame_bgr.copy()
+
     color = (0, 80, 255) if lost else (0, 220, 0)
     cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+
     if score is not None:
         label = f"{'LOST' if lost else 'OK'}  {score:.2f}"
-        cv2.putText(out, label, (x, max(y - 8, 16)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.putText(
+            out,
+            label,
+            (x, max(y - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+        )
+
+    hud = []
+
+    if backend is not None:
+        hud.append(str(backend))
+
+    if tracker_fps is not None:
+        hud.append(f"Tracker: {tracker_fps:.1f} FPS")
+
+    if model_fps is not None:
+        hud.append(f"Model: {model_fps:.1f} FPS")
+
+    if hud:
+        cv2.putText(
+            out,
+            " | ".join(hud),
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+        )
+
     return out
+
+
+def prep_frame(rgb_np):
+    """Normalize a browser-supplied RGB numpy frame into the working BGR format.
+    This is the only place frame pre-processing happens now, since both the
+    one-shot capture and the streaming loop funnel through here."""
+    bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
+    bgr = cv2.resize(bgr, (512, 512))
+    bgr = cv2.flip(bgr, 1)
+    return bgr
+
 
 def follow_worker():
     while True:
@@ -70,23 +122,18 @@ def follow_worker():
                 f"{API_BASE}/follow/command",
                 json={"bbox": bbox},
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(e)
 
-# ── Step 1: Capture ───────────────────────────────────────────
-def capture_frame():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        return None, "Failed to open webcam."
-    ret, frame = cap.read()
-    frame = cv2.resize(frame, (512, 512))
-    frame = cv2.flip(frame, 1)
-    cap.release()
-    if not ret:
-        return None, "Failed to capture frame."
-    state["last_frame_bgr"] = frame.copy()
-    # return RGB numpy for display in gr.Image
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), "Frame captured. Now segment."
+# ── Step 1: Capture (browser webcam — no server-side VideoCapture) ──
+def capture_frame(np_img):
+    """np_img is whatever the browser's webcam widget currently holds
+    (an RGB numpy array). We never open a camera device on the server."""
+    if np_img is None:
+        return None, "No webcam frame yet — allow camera access in your browser and try again."
+    frame_bgr = prep_frame(np_img)
+    state["last_frame_bgr"] = frame_bgr
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), "Frame captured. Now segment."
 
 # ── Click collector ───────────────────────────────────────────
 
@@ -112,7 +159,6 @@ def run_segment(np_img, method, click_pts_json, text_prompt, ref_pil):
     if np_img is None:
         return None, None, "Capture a frame first.", gr.update(visible=False)
     frame_bgr = state["last_frame_bgr"]
-    state["last_frame_bgr"] = frame_bgr
 
     files = {"file": ("frame.jpg", numpy_to_bytes(frame_bgr), "image/jpeg")}
     data  = {"method": method}
@@ -155,7 +201,7 @@ def run_segment(np_img, method, click_pts_json, text_prompt, ref_pil):
 # ── Step 3: Init tracker ──────────────────────────────────────
 def init_tracker():
     if state["last_frame_bgr"] is None or state["mask_b64"] is None:
-        return "Run segmentation first.", gr.update(visible=False)
+        return "Run segmentation first.", gr.update(visible=False), gr.update(visible=False)
     files = {"file": ("frame.jpg", numpy_to_bytes(state["last_frame_bgr"]), "image/jpeg")}
     data  = {"mask_b64": state["mask_b64"]}
     try:
@@ -166,9 +212,11 @@ def init_tracker():
         )
         resp.raise_for_status()
     except Exception as e:
-        return f"Track init failed: {e}", gr.update(visible=False)
+        return f"Track init failed: {e}", gr.update(visible=False), gr.update(visible=False)
     bbox = resp.json()["bbox"]
-    return f"Tracker ready. bbox={bbox}", gr.update(visible=True)
+    # live_group AND the streaming webcam both become visible so the browser
+    # starts pushing frames once tracking is actually possible.
+    return f"Tracker ready. bbox={bbox}", gr.update(visible=True), gr.update(visible=True)
 
 # ── Step 4: Track / Follow ────────────────────────────────────
 def stop_all():
@@ -176,20 +224,32 @@ def stop_all():
     state["tracking"]  = False
     return "Stopped.", None, ""
 
+def push_live_frame(rgb_np):
+    """Wired to the streaming webcam component's .stream() event. The browser
+    calls this repeatedly with fresh frames; we just drop them in a queue for
+    the background WS thread to consume. Still zero server-side camera access."""
+    if rgb_np is None:
+        return
+    frame_bgr = prep_frame(rgb_np)
+    if live_frame_queue.full():
+        try:
+            live_frame_queue.get_nowait()
+        except Empty:
+            pass
+    live_frame_queue.put(frame_bgr)
+
 def _ws_thread(mode):
-    """Runs in background thread — opens webcam, streams to WS."""
+    """Runs in background thread — reads frames pushed in from the browser
+    webcam (via live_frame_queue) and streams them to the backend WS."""
     async def run():
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            state["ws_error"] = "Cannot open webcam."
-            state["tracking"] = False
-            return
         try:
             async with websockets.connect(f"{WS_BASE}/track/live") as ws:
                 while not state["stop_flag"]:
-                    ret, frame = cap.read()
-                    frame = cv2.resize(frame, (512, 512))
-                    frame = cv2.flip(frame, 1)
+                    try:
+                        frame = live_frame_queue.get(timeout=1.0)
+                    except Empty:
+                        continue
+
                     jpg = numpy_to_bytes(frame)
                     await ws.send(jpg)
                     raw = await ws.recv()
@@ -206,16 +266,14 @@ def _ws_thread(mode):
 
                     if mode == "follow" and not result.get("lost"):
                         try:
-                            if mode == "follow" and not result.get("lost"):
-                                if follow_queue.full():
-                                    follow_queue.get_nowait()
-                                follow_queue.put(result["bbox"])
-                        except Exception:
-                            pass
+                            if follow_queue.full():
+                                follow_queue.get_nowait()
+                            follow_queue.put(result["bbox"])
+                        except Exception as e:
+                            print(e)
         except Exception as e:
             state["ws_error"] = str(e)
         finally:
-            cap.release()
             state["tracking"] = False
 
     asyncio.run(run())
@@ -235,15 +293,35 @@ def _start_and_poll(mode):
         if not result_queue.empty():
             frame_bgr, result = result_queue.get()
 
-            bbox  = result["bbox"]
+            bbox = result["bbox"]
+            model_fps = result["model_fps"]
+            tracker_fps = result["tracker_fps"]
+            backend = result["backend"]
             score = result["score"]
-            lost  = result["lost"]
-            fps   = result["fps"]
+            lost = result["lost"]
 
-            vis    = draw_bbox(frame_bgr, bbox, score, lost)
-            status = ("follow mode active" if not lost else "LOST") if mode == "follow" \
-                     else f"{'LOST' if lost else 'tracking'}  score={score:.2f}"
-            fps_str = f'<p class="fps-display">{fps:.1f} fps</p>'
+            vis = draw_bbox(
+                frame_bgr,
+                bbox,
+                backend,
+                model_fps,
+                tracker_fps,
+                score,
+                lost,
+            )
+
+            status = (
+                "follow mode active" if not lost else "LOST"
+            ) if mode == "follow" else (
+                f"{'LOST' if lost else 'tracking'}  score={score:.2f}"
+            )
+
+            fps_str = (
+                f'<p class="fps-display">'
+                f'Model: {model_fps:.1f} FPS | '
+                f'Tracker: {tracker_fps:.1f} FPS'
+                f'</p>'
+            )
 
             yield cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), status, fps_str
         else:
@@ -276,13 +354,29 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
         with gr.Column(scale=5):
 
             gr.HTML('<p class="step-label">Capture frame</p>')
-            input_frame = gr.Image(
-                label="Captured frame",
-                type="numpy",
-                interactive=True, # needed for click segmentation
-                sources=["webcam"]
+            gr.HTML(
+                '<p class="status-txt">Allow camera access below, then press the '
+                'shutter/camera icon INSIDE the widget to snap a photo.</p>'
             )
-            capture_btn    = gr.Button("Capture from webcam", variant="secondary")
+            # Webcam widget: only job is snapping a photo. Its .select() click
+            # events are unreliable in Gradio while it's in webcam-source mode,
+            # so we never try to mark click-points directly on this one.
+            webcam_widget = gr.Image(
+                label="Webcam",
+                type="numpy",
+                sources=["webcam"],
+                streaming=False,
+                interactive=True,
+            )
+            # Plain display/annotation image — populated from webcam_widget after
+            # a snapshot. Not a webcam source itself, so .select() click events
+            # fire reliably for click-based segmentation.
+            input_frame = gr.Image(
+                label="Captured frame (click here to mark segmentation points)",
+                type="numpy",
+                interactive=True,
+                sources=[],
+            )
             capture_status = gr.HTML('<p class="status-txt"></p>')
 
             gr.HTML('<p class="step-label" style="margin-top:14px;">2 — segmentation method</p>')
@@ -333,11 +427,28 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
                         follow_btn = gr.Button("Follow", variant="primary")
                         stop_btn   = gr.Button("Stop",   variant="stop")
 
+                    gr.HTML(
+                        '<p class="status-txt">Press the button below to start live feed, then click Track or Follow. </p>'
+                    )
+                    # This is the ONLY thing that keeps the browser camera alive
+                    # during Track/Follow. It streams frames straight into
+                    # push_live_frame() via .stream() below 
+                    live_webcam = gr.Image(
+                        label="Live Camera",
+                        sources=["webcam"],
+                        streaming=True,
+                        type="numpy",
+                        height=160,
+                    )
+
     # ── Wiring ────────────────────────────────────────────────
 
-    # capture
-    capture_btn.click(
+    # capture — fires the moment the webcam widget actually holds a snapshot
+    # (i.e. right after the user presses its internal shutter icon), rather
+    # than waiting for a separate button that could read a stale/empty value.
+    webcam_widget.change(
         capture_frame,
+        inputs=[webcam_widget],
         outputs=[input_frame, capture_status],
     )
 
@@ -366,10 +477,18 @@ with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking
         [output_frame, seg_status, action_group],
     )
 
-    # init tracker
+    # init tracker — also reveals the streaming webcam so the browser starts
+    # pushing live frames only once there's a tracker to feed them to
     track_init_btn.click(
         init_tracker, [],
-        [track_init_status, live_group],
+        [track_init_status, live_group, live_webcam],
+    )
+
+    # live webcam stream -> queue consumed by the background WS thread
+    live_webcam.stream(
+        push_live_frame,
+        inputs=[live_webcam],
+        outputs=[],
     )
 
     # track + follow — streaming=True is critical

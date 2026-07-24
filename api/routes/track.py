@@ -42,6 +42,7 @@ async def init_track(file: UploadFile, mask_b64: str = Form(...)):
     bbox = tracker.init_from_mask(frame, mask)
 
     return InitTrackResponse(bbox=list(bbox))
+
 @router.websocket("/track/live")
 async def track_live(websocket: WebSocket):
     await websocket.accept()
@@ -73,12 +74,13 @@ async def track_live(websocket: WebSocket):
                 "bbox": result["bbox"],
                 "score": result["score"],
                 "lost": result["lost"],
-                "fps": result["fps"],
+                "model_fps": result["model_fps"],
+                "tracker_fps": result["tracker_fps"],
+                "backend": result["backend"],
             })
-
     except WebSocketDisconnect:
         pass
-    
+
 @router.post("/track/reset")
 def reset():
     reset_tracker()
