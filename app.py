@@ -16,7 +16,7 @@ import threading
 import time
 from queue import Queue, Empty
 
-from core.utils.image_preprocessing import pil_to_bgr, bgr_to_pil
+from core.utils.image_preprocessing import pil_to_bgr
 
 API_BASE = "http://localhost:8000"
 WS_BASE  = "ws://localhost:8000"

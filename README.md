@@ -325,13 +325,12 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 
 ## 🛣️ Roadmap
 
-- [x] Reference Image Tracking
-- [x] Text Prompt Tracking
 - [x] FastAPI & Gradio Integration
 - [x] ONNXRuntime Backend
 - [x] TensorRT Backend
+- [x] Separation of backend manager with tracking wrapper
+- [x] Single Synchronization point for tracker
 
-- [ ] Single Synchronization point for tracker 
 - [ ] Future Re-Identification case - SAM usage when confidence drops
 - [ ] Improve Tracker - use dasiamrpn's outputs
 
