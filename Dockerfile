@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-docker.txt .
+COPY requirements-gpu.txt .
 
 RUN python -m pip install \
     --break-system-packages \
