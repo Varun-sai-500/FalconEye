@@ -1,6 +1,8 @@
 import time
 import numpy as np
 import cv2
+from typing import Optional
+from pathlib import Path
 import torch
 
 from core.utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
@@ -35,6 +37,8 @@ class DaSiamRPNTracker:
             benchmark=True
         )
         self.device = self.backend.device
+        self._pinned_buffer: Optional[torch.Tensor] = None
+
 
         self.state           = None
         self.last_good_state = None
@@ -60,17 +64,28 @@ class DaSiamRPNTracker:
         self.lost_count = 0
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
-        # 1. Convert numpy array to torch tensor
-        cpu_tensor = torch.from_numpy(frame).float()
+        # Convert numpy array to a lightweight torch tensor view
+        # (Note: from_numpy creates a view; we defer .float() to avoid a redundant copy)
+        cpu_tensor = torch.from_numpy(frame)
 
-        # 2. Check if the target device is a GPU (CUDA/MPS)
+        # Check if the target device is an accelerator (CUDA/MPS)
         if self.device.type != "cpu":
-            # Pin memory ONLY if an accelerator is actually available
-            pinned_tensor = cpu_tensor.pin_memory()
-            return pinned_tensor.to(self.device, non_blocking=True)
+            # Lazily allocate or resize the pinned staging buffer
+            if self._pinned_buffer is None or self._pinned_buffer.shape != cpu_tensor.shape:
+                # Allocate page-locked (pinned) memory on the host matching the frame shape
+                self._pinned_buffer = torch.empty(
+                    cpu_tensor.shape,
+                    dtype=torch.float32,
+                    pin_memory=True
+                )
 
-        # 3. Fallback safely if running on pure CPU
-        return cpu_tensor.to(self.device)
+            # Copy the numpy view data in-place into the pinned buffer and cast to float
+            self._pinned_buffer.copy_(cpu_tensor)
+
+            # Asynchronously transfer to the GPU
+            return self._pinned_buffer.to(self.device, non_blocking=True)
+
+        return cpu_tensor.float().to(self.device)
 
     @staticmethod
     def _clone_state(state: dict) -> dict:
@@ -98,6 +113,7 @@ class DaSiamRPNTracker:
     def init_from_mask(self, frame: np.ndarray, mask: np.ndarray) -> tuple:
         if frame is None or mask is None:
             raise ValueError("frame and mask are required")
+        self.init_shape = frame.shape
 
         ys, xs = np.where(mask > 0)
         if len(xs) == 0:
@@ -126,23 +142,33 @@ class DaSiamRPNTracker:
     # -----------------------------------------------------------
     # TRACK STEP  (FastAPI / per-frame API)
     # -----------------------------------------------------------
-
     def track_step(self, frame: np.ndarray) -> dict:
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_step()")
+
         t0 = time.perf_counter()
         active_net, backend = self.backend.active_net
         self.state["net"] = active_net
 
         im_t = self._frame_to_gpu(frame)
 
+        # Runs inference and decodes anchors
         self.state = SiamRPN_track(self.state, im_t)
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
-        self.last_tracking_fps = 1.0 / (time.perf_counter() - t0)
-        raw_score = float(self.state.get("score", 1.0))
 
-        # 1. Safely handle NaN scores
+        # TARGETED STREAM SYNCHRONIZATION
+        if self.device.type == "cuda":
+            if backend == "TensorRT" and hasattr(active_net, 'stream'):
+                # Force CPU host to block until ONLY the custom TRT stream finishes processing.
+                # This guarantees that the buffers are filled and time.perf_counter() is completely accurate.
+                active_net.stream.synchronize()
+            else:
+                # Secure fallback for default PyTorch stream and ONNX
+                torch.cuda.current_stream().synchronize()
+
+        # Host-side timer now accurately reflects combined (GPU compute + CPU preprocessing) time
+        self.last_tracking_fps = 1.0 / (time.perf_counter() - t0)
+
+        raw_score = float(self.state.get("score", 1.0))
         if np.isnan(raw_score):
             raw_score = 0.0
 
@@ -153,14 +179,10 @@ class DaSiamRPNTracker:
         )
 
         score = self.score_ema
-
-        # 2. Check if the output bounding boxes contain any NaN values
         coords_nan = torch.isnan(self.state["target_pos"]).any() or torch.isnan(self.state["target_sz"]).any()
         weak = (score < self.CONF_THRESH) or coords_nan
 
         H, W = frame.shape[:2]
-
-        # 3. INTERCEPT AND ROLLBACK BEFORE CONVERTING TO INT
         if weak:
             self.lost_count += 1
             if self.last_good_state is not None:
@@ -169,7 +191,7 @@ class DaSiamRPNTracker:
             self.lost_count = 0
             self.last_good_state = self._clone_state(self.state)
 
-        # 4. Now mapping to integer is safe because NaN states have been reverted
+        # Mapping to integer is completely protected from NaN states
         x, y, w, h = map(
             int,
             cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
@@ -195,15 +217,11 @@ class DaSiamRPNTracker:
             "model_fps": float(self.backend.model_fps),
             "backend": backend,
         }
+        # -----------------------------------------------------------
+        # TRACK LIVE
+        # -----------------------------------------------------------
 
-    # -----------------------------------------------------------
-    # TRACK LIVE  (local display / debug)
-    # -----------------------------------------------------------
-
-    def track_live(self, video_src="input.mov", display: bool = False):
-        tracker_fps_sum = 0.0
-        model_fps_sum = 0.0
-        frames = 0
+    def track_live(self, video_src="input.mp4", display: bool = False):
         if self.state is None:
             raise RuntimeError("Call init_from_mask() before track_live()")
 
@@ -214,8 +232,27 @@ class DaSiamRPNTracker:
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {video_src}")
 
-        SCREEN_W = 512
-        SCREEN_H = 512
+        results_dir = Path("results")
+        results_dir.mkdir(exist_ok=True)
+
+        output_path = results_dir / f"{backend}_backend_tracked.mp4"
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = fps if fps > 0 else 30.0
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        # ------------------------------------------------------
+
+        tracker_fps_sum = 0.0
+        model_fps_sum = 0.0
+        frames = 0
 
         try:
             while True:
@@ -223,52 +260,54 @@ class DaSiamRPNTracker:
                 if not ret:
                     break
 
-                frame = cv2.resize(frame, (SCREEN_W, SCREEN_H))
-                result = self.track_step(frame)  # numpy in, GPU tensor conversion happens inside
+                result = self.track_step(frame)
+
                 tracker_fps_sum += result["tracker_fps"]
                 model_fps_sum += result["model_fps"]
                 frames += 1
 
-                bbox         = result["bbox"]
-                score        = result["score"]
-                lost         = result["lost"]
-                tracker_fps  = result["tracker_fps"]
-                model_fps    = result["model_fps"]
-                label         = result["backend"]
-                x, y, w, h = bbox
+                bbox = result["bbox"]
+                score = result["score"]
+                lost = result["lost"]
+
+                if lost:
+                    color = (0, 0, 255)
+                elif score >= self.CONF_THRESH:
+                    color = (0, 255, 0)
+                else:
+                    color = (0, 165, 255)
+
+                if not lost:
+                    x, y, w, h = bbox
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+                cv2.putText(
+                    frame,
+                    (
+                        f'{result["backend"]} | '
+                        f'Tracker:{result["tracker_fps"]:.0f} | '
+                        f'Model:{result["model_fps"]:.0f} | '
+                        f'S:{score:.2f}'
+                    ),
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    color,
+                    2,
+                )
+
+                writer.write(frame)
 
                 if display:
-                    if not lost:
-                        color = (0, 255, 0) if score >= self.CONF_THRESH else (0, 165, 255)
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-                    hud_color = (0, 0, 255) if lost else (
-                        (0, 255, 0) if score >= self.CONF_THRESH else (0, 165, 255)
-                    )
-                    cv2.putText(
-                        frame,
-                        f"{label} | Tracker:{int(tracker_fps)} | Model:{int(model_fps)} | S:{score:.2f}",
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.65,
-                        hud_color,
-                        2,
-                    )
                     cv2.imshow("DaSiamRPN", frame)
-
-                    if cv2.waitKey(1) & 0xFF in [ord('q'), ord('Q')]:
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
                         break
 
                 yield None if lost else result
+
         finally:
             cap.release()
-
-            if frames:
-                print("=" * 50)
-                print(f"Frames processed : {frames}")
-                print(f"Average Tracker FPS : {tracker_fps_sum / frames:.2f}")
-                print(f"Average Model FPS   : {model_fps_sum / frames:.2f}")
-                print("=" * 50)
+            writer.release()
 
             if display:
                 try:
@@ -276,3 +315,11 @@ class DaSiamRPNTracker:
                 except cv2.error:
                     pass
 
+            print(f"[INFO] Saved tracked video to: {output_path}")
+
+            if frames:
+                print("=" * 50)
+                print(f"Frames processed    : {frames}")
+                print(f"Average Tracker FPS : {tracker_fps_sum / frames:.2f}")
+                print(f"Average Model FPS   : {model_fps_sum / frames:.2f}")
+                print("=" * 50)

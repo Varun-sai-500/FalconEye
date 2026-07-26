@@ -118,9 +118,18 @@ class TRTNet:
 class ONNXNet:
     def __init__(self, onnx_path, device=None):
         self.device = device or torch.device('cpu')
-        providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                     if ORT_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers()
-                     else ['CPUExecutionProvider'])
+        if ORT_AVAILABLE and CUDA_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers():
+            # Get the current active CUDA stream pointer
+            current_stream_ptr = torch.cuda.current_stream().cuda_stream
+
+            providers = [
+                ('CUDAExecutionProvider', {
+                    'user_compute_stream': str(current_stream_ptr)
+                }),
+                'CPUExecutionProvider'
+            ]
+        else:
+            providers = ['CPUExecutionProvider']
 
         so = ort.SessionOptions()
         self.session = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
@@ -302,26 +311,35 @@ class BackendManager:
         for _ in range(warmup):
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
 
-        if self.device.type == "cuda": torch.cuda.synchronize()
+        # Clear the entire GPU pipeline before starting the real test
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
 
         latencies = []
         for _ in range(iterations):
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
             t0 = time.perf_counter()
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
+
+            # ---------------------------------------------------------
+            # CRITICAL FIX: Wait for inference to finish before timing!
+            # ---------------------------------------------------------
             if self.device.type == "cuda":
-                torch.cuda.synchronize()
+                if name == "TensorRT" and hasattr(net, 'stream'):
+                    net.stream.synchronize()
+                else:
+                    torch.cuda.current_stream().synchronize()
+
             latencies.append((time.perf_counter() - t0) * 1000.0)
 
         avg_latency = np.mean(latencies)
         p99_latency = np.percentile(latencies, 99)
         fps = 1000.0 / avg_latency if avg_latency > 0 else 0.0
         self.model_fps = fps
+
         print(f"\n" + "="*60)
         print(f" BENCHMARK RUNTIME REPORT: {name.upper()}")
         print("="*60)
-        print(f" * end-to-end callable FPS : {fps:.2f} FPS")
-        print(f" * Avg Engine Latency   : {avg_latency:.3f} ms")
-        print(f" * P99 Tail Latency     : {p99_latency:.3f} ms")
+        print(f" * Synchronized Host Call FPS : {fps:.2f} FPS")
+        print(f" * Avg Host-Synchronized Latency: {avg_latency:.3f} ms")
+        print(f" * P99 Tail Latency             : {p99_latency:.3f} ms")
         print("="*60 + "\n")
