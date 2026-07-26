@@ -124,9 +124,8 @@ async def track_live(websocket: WebSocket):
             if active_tracking_task is current_task:
                 active_tracking_task = None
 
-
-@router.post("/track/debug")
-async def debug(video: UploadFile = File(...)):
+@router.post("/offline_track")
+async def offline_track(video: UploadFile = File(...)):
     tracker = get_tracker()
 
     with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as tmp:
@@ -137,7 +136,6 @@ async def debug(video: UploadFile = File(...)):
         pass
 
     return {"status": "done"}
-
 # ----------------------------------------------------------------------
 # Reset
 # ----------------------------------------------------------------------

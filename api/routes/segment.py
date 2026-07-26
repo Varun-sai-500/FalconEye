@@ -10,7 +10,6 @@ from fastapi import HTTPException
 from enum import Enum
 
 from services.segmentation_service import sam_service, clipseg_service
-from core.utils.image_preprocessing import preprocess_frame
 from core.utils.boundingbox import get_boundary
 
 router = APIRouter()
@@ -108,18 +107,19 @@ async def segment(
         ref_bgr=ref_bgr,
     )
 
-    rgb_frame, frame_resized = preprocess_frame(frame_bgr)
+    rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
     if method == SegmentMethod.click:
         mask = sam_service.predict_points(rgb_frame, point_list)
 
     elif method == SegmentMethod.reference:
-        ref_rgb, _ = preprocess_frame(ref_bgr)
+        ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
         mask = clipseg_service.predict(rgb_frame, ref_image=ref_rgb)
 
     elif method == SegmentMethod.text:
         mask = clipseg_service.predict(rgb_frame, text=text.strip())
-    bbox, _ = get_boundary(mask, frame_resized)
+
+    bbox, _ = get_boundary(mask, frame_bgr)
 
     return SegmentResponse(
         mask_b64=encode_mask(mask),

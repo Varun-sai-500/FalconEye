@@ -13,26 +13,22 @@ struct Command {
 class RoverFollower {
 public:
     RoverFollower(
-        int   frame_w          = 512,
-        int   frame_h          = 512,
         int   stop_bbox_height = 180,
         float center_threshold = 30.0f,
         float linear_speed     = 0.3f,
         float angular_speed    = 0.4f
     )
-        : frame_w_(frame_w),
-          frame_h_(frame_h),
-          stop_bbox_height_(stop_bbox_height),
+        : stop_bbox_height_(stop_bbox_height),
           center_threshold_(center_threshold),
           linear_speed_(linear_speed),
           angular_speed_(angular_speed)
     {}
 
-    Command compute(int x, int y, int w, int h) const {
+    Command compute(int x, int y, int w, int h, int frame_w, int frame_h) const {
         float cx      = x + w / 2.0f;
         float cy      = y + h / 2.0f;
-        float error_x = cx - frame_w_ / 2.0f;
-        float error_y = cy - frame_h_ / 2.0f;
+        float error_x = cx - frame_w / 2.0f;
+        float error_y = cy - frame_h / 2.0f;
 
         Command cmd{};
         cmd.error_x = error_x;
@@ -57,19 +53,17 @@ public:
 
         // forward speed
         if (error_y < -center_threshold_)
-            cmd.linear = linear_speed_;          // far — full speed
+            cmd.linear = linear_speed_;         // far — full speed
         else if (error_y > center_threshold_)
             cmd.linear = linear_speed_ * 0.4f;  // close-ish — creep
         else
-            cmd.linear = linear_speed_;          // vertically centered
+            cmd.linear = linear_speed_;         // vertically centered
 
         cmd.state = (cmd.angular != 0.0f) ? 1 : 0;  // turning or forward
         return cmd;
     }
 
 private:
-    int   frame_w_;
-    int   frame_h_;
     int   stop_bbox_height_;
     float center_threshold_;
     float linear_speed_;

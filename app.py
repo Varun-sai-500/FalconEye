@@ -16,7 +16,6 @@ import threading
 import time
 from queue import Queue, Empty
 
-from core.utils.image_preprocessing import pil_to_bgr
 
 API_BASE = "http://localhost:8000"
 WS_BASE  = "ws://localhost:8000"
@@ -39,6 +38,9 @@ def numpy_to_bytes(frame_bgr, quality=70):
     _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
     return buf.tobytes()
 
+def pil_to_bgr(pil_img):
+    rgb = np.array(pil_img.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 def decode_mask_b64(mask_b64):
     mask_bytes = base64.b64decode(mask_b64)
@@ -108,8 +110,6 @@ def prep_frame(rgb_np):
     This is the only place frame pre-processing happens now, since both the
     one-shot capture and the streaming loop funnel through here."""
     bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-    bgr = cv2.resize(bgr, (512, 512))
-    bgr = cv2.flip(bgr, 1)
     return bgr
 
 
