@@ -5,9 +5,7 @@ from typing import Optional
 from pathlib import Path
 import torch
 
-from core.utils.run_SiamRPN import SiamRPN_init, SiamRPN_track
-from core.utils.utilities import cxy_wh_2_rect
-
+from core.tracking.pipeline import DaSiamRPN_init, DaSiamRPN_track
 from .backend_manager import BackendManager
 
 
@@ -18,8 +16,8 @@ class DaSiamRPNTracker:
     One instance = one tracking session.
 
     Frames arrive as numpy BGR (from cv2/FastAPI upload) and are converted to a
-    CUDA float32 tensor exactly once per call, at the top of init_from_mask/track_step.
-    Everything downstream (run_SiamRPN.py) operates on that tensor with a single
+    CUDA/MPS half/bfloat16 tensor exactly once per call, at the top of init_from_bbox/track_step.
+    Everything downstream (pipeline.py) operates on that tensor with a single
     .cpu() sync per frame, inside tracker_eval.
     """
 
@@ -39,6 +37,19 @@ class DaSiamRPNTracker:
         self.device = self.backend.device
         self._pinned_buffer: Optional[torch.Tensor] = None
 
+        # Determine optimal half-precision type based on device capability
+        if self.device.type == "cuda":
+            major, minor = torch.cuda.get_device_capability(self.device)
+            if major >= 8:
+                self.dtype = torch.bfloat16
+                print(f"[INFO] Compute capability {major}.{minor} >= 8.0 detected. Using bfloat16 precision.")
+            else:
+                self.dtype = torch.float16
+                print(f"[INFO] Compute capability {major}.{minor} < 8.0 detected. Using float16 precision.")
+        elif self.device.type == "mps":
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
 
         self.state           = None
         self.last_good_state = None
@@ -52,6 +63,11 @@ class DaSiamRPNTracker:
         self.MAX_LOST    = 15
         self.lost_count  = 0
 
+        # Keep track of center for kinematic noise analytics
+        self._prev_bench_center = None
+        self._was_lost_state = False
+        self._current_lost_run = 0
+
     @property
     def initialized(self) -> bool:
         return self.state is not None
@@ -62,111 +78,137 @@ class DaSiamRPNTracker:
         self.score_ema = None
         self.fps_ema = None
         self.lost_count = 0
+        self._prev_bench_center = None
+        self._was_lost_state = False
+        self._current_lost_run = 0
+
+    @staticmethod
+    def _center_to_rect(center, size):
+        return torch.stack((
+            center[0] - size[0] * 0.5,
+            center[1] - size[1] * 0.5,
+            size[0],
+            size[1],
+        ))
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
-        # Convert numpy array to a lightweight torch tensor view
-        # (Note: from_numpy creates a view; we defer .float() to avoid a redundant copy)
         cpu_tensor = torch.from_numpy(frame)
 
-        # Check if the target device is an accelerator (CUDA/MPS)
         if self.device.type != "cpu":
-            # Lazily allocate or resize the pinned staging buffer
-            if self._pinned_buffer is None or self._pinned_buffer.shape != cpu_tensor.shape:
-                # Allocate page-locked (pinned) memory on the host matching the frame shape
-                self._pinned_buffer = torch.empty(
-                    cpu_tensor.shape,
-                    dtype=torch.float32,
-                    pin_memory=True
-                )
+            # Ensure pinned buffer tracks both size changes and dtype configurations (CUDA optimized)
+            if self.device.type == "cuda":
+                if (self._pinned_buffer is None
+                        or self._pinned_buffer.shape != cpu_tensor.shape
+                        or self._pinned_buffer.dtype != self.dtype):
+                    self._pinned_buffer = torch.empty(
+                        cpu_tensor.shape,
+                        dtype=self.dtype,
+                        pin_memory=True
+                    )
 
-            # Copy the numpy view data in-place into the pinned buffer and cast to float
-            self._pinned_buffer.copy_(cpu_tensor)
+                # Cast type on host using pinned memory to optimize HtoD bandwidth execution
+                self._pinned_buffer.copy_(cpu_tensor.to(self.dtype))
+                return self._pinned_buffer.to(self.device, non_blocking=True)
 
-            # Asynchronously transfer to the GPU
-            return self._pinned_buffer.to(self.device, non_blocking=True)
+            # Direct transfer strategy for hardware architectures without memory pinning (MPS)
+            return cpu_tensor.to(device=self.device, dtype=self.dtype)
 
-        return cpu_tensor.float().to(self.device)
+        return cpu_tensor.to(dtype=self.dtype, device=self.device)
 
     @staticmethod
     def _clone_state(state: dict) -> dict:
-        """
-        dict.copy() is shallow — fine for scalars/config objects that are never
-        mutated in place, but target_pos/target_sz get REASSIGNED (not
-        mutated) every SiamRPN_track call, so aliasing the tensor reference here
-        is safe. Being explicit about it rather than relying on that as an
-        accident: we .clone() the two tensors that matter so last_good_state
-        can never be silently affected by a future in-place edit to state.
-        """
         new_state = state.copy()
         new_state['target_pos'] = state['target_pos'].clone()
         new_state['target_sz'] = state['target_sz'].clone()
         if "r1_kernel" in state:
             new_state["r1_kernel"] = state["r1_kernel"].clone()
-
         if "cls1_kernel" in state:
             new_state["cls1_kernel"] = state["cls1_kernel"].clone()
         return new_state
 
     # -----------------------------------------------------------
-    # INIT FROM MASK
+    # INIT FROM BBOX
     # -----------------------------------------------------------
-    def init_from_mask(self, frame: np.ndarray, mask: np.ndarray) -> tuple:
-        if frame is None or mask is None:
-            raise ValueError("frame and mask are required")
-        self.init_shape = frame.shape
+    def init_from_bbox(
+        self,
+        frame: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
 
-        ys, xs = np.where(mask > 0)
-        if len(xs) == 0:
-            raise ValueError("Mask is empty — nothing to track")
+        if frame is None:
+            raise ValueError("frame is required")
+        if bbox is None:
+            raise ValueError("bbox is required")
 
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
-        w  = max(10, x_max - x_min)
-        h  = max(10, y_max - y_min)
-        cx = x_min + w / 2
-        cy = y_min + h / 2
+        x, y, w, h = map(int, bbox)
 
-        target_pos = [cx, cy]   # plain python list — SiamRPN_init expects this now
-        target_sz  = [w, h]
+        if w <= 0 or h <= 0:
+            raise ValueError("Invalid bbox dimensions")
 
+        cx = x + w / 2
+        cy = y + h / 2
+
+        target_pos = [cx, cy]
+        target_sz = [w, h]
         im_t = self._frame_to_gpu(frame)
-        self.state           = SiamRPN_init(im_t, target_pos, target_sz, self.backend.get_pt_net())
+
+        # CRITICAL FIX: Ensure the PyTorch template extraction network matches the current session precision parameters
+        net = self.backend.get_pt_net()
+        if isinstance(net, torch.nn.Module):
+            net = net.to(device=self.device, dtype=self.dtype).eval()
+
+        self.state = DaSiamRPN_init(
+            im_t,
+            target_pos,
+            target_sz,
+            net,
+        )
         self.last_good_state = self._clone_state(self.state)
-        self.score_ema       = None
-        self.lost_count      = 0
-        self.backend.export_and_build(self.state["r1_kernel"], self.state["cls1_kernel"])
+        self.score_ema = None
+        self.lost_count = 0
 
-        print(f"[INFO] Tracker initialised | box: ({x_min},{y_min},{w},{h})")
-        return (x_min, y_min, w, h)
+        self.backend.export_and_build(
+            self.state["r1_kernel"],
+            self.state["cls1_kernel"],
+        )
+        print(f"[INFO] Tracker initialised | box: ({x}, {y}, {w}, {h})")
+        return (x, y, w, h)
 
     # -----------------------------------------------------------
-    # TRACK STEP  (FastAPI / per-frame API)
+    # TRACK STEP (Per-frame API pipeline)
     # -----------------------------------------------------------
+    @torch.inference_mode()
     def track_step(self, frame: np.ndarray) -> dict:
         if self.state is None:
-            raise RuntimeError("Call init_from_mask() before track_step()")
+            raise RuntimeError("Call init_from_bbox() before track_step()")
 
         t0 = time.perf_counter()
         active_net, backend = self.backend.active_net
+
+        # CRITICAL FIX: If running tracking natively through PyTorch, cast network dynamically
+        if backend == "PyTorch" and isinstance(active_net, torch.nn.Module):
+            active_net = active_net.to(device=self.device, dtype=self.dtype).eval()
+
         self.state["net"] = active_net
 
         im_t = self._frame_to_gpu(frame)
 
-        # Runs inference and decodes anchors
-        self.state = SiamRPN_track(self.state, im_t)
+        # Execute forward pass within the targeted precision context
+        autocast_enabled = self.device.type in ["cuda", "cpu"]
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=autocast_enabled):
+            self.state = DaSiamRPN_track(self.state, im_t)
 
         # TARGETED STREAM SYNCHRONIZATION
         if self.device.type == "cuda":
             if backend == "TensorRT" and hasattr(active_net, 'stream'):
-                # Force CPU host to block until ONLY the custom TRT stream finishes processing.
-                # This guarantees that the buffers are filled and time.perf_counter() is completely accurate.
                 active_net.stream.synchronize()
             else:
-                # Secure fallback for default PyTorch stream and ONNX
                 torch.cuda.current_stream().synchronize()
+        elif self.device.type == "mps":
+            torch.mps.synchronize()
 
-        # Host-side timer now accurately reflects combined (GPU compute + CPU preprocessing) time
-        self.last_tracking_fps = 1.0 / (time.perf_counter() - t0)
+        raw_latency_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_tracking_fps = 1000.0 / raw_latency_ms
 
         raw_score = float(self.state.get("score", 1.0))
         if np.isnan(raw_score):
@@ -191,10 +233,9 @@ class DaSiamRPNTracker:
             self.lost_count = 0
             self.last_good_state = self._clone_state(self.state)
 
-        # Mapping to integer is completely protected from NaN states
         x, y, w, h = map(
             int,
-            cxy_wh_2_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
+            self._center_to_rect(self.state["target_pos"], self.state["target_sz"]).tolist(),
         )
 
         x = max(0, min(x, W - w))
@@ -209,17 +250,44 @@ class DaSiamRPNTracker:
             else self.alpha_fps * self.fps_ema + (1 - self.alpha_fps) * fps_inst
         )
 
+        # --- Kinematics & Stability Telemetry ---
+        center_x, center_y = x + w / 2.0, y + h / 2.0
+        jerk_delta = 0.0
+
+        if not lost:
+            if self._prev_bench_center is not None:
+                jerk_delta = float(np.sqrt((center_x - self._prev_bench_center[0])**2 + (center_y - self._prev_bench_center[1])**2))
+            self._prev_bench_center = (center_x, center_y)
+        else:
+            self._prev_bench_center = None
+
+        is_recovery_frame = False
+        recovery_duration = 0
+
+        if not lost:
+            if self._was_lost_state:
+                is_recovery_frame = True
+                recovery_duration = self._current_lost_run
+                self._current_lost_run = 0
+                self._was_lost_state = False
+        else:
+            self._current_lost_run += 1
+            self._was_lost_state = True
+
         return {
             "bbox": (x, y, w, h),
             "score": float(score),
             "lost": lost,
             "tracker_fps": float(self.fps_ema),
-            "model_fps": float(self.backend.model_fps),
             "backend": backend,
+            "metrics": {
+                "raw_latency_ms": raw_latency_ms,
+                "jerk_delta": jerk_delta,
+                "is_recovery": is_recovery_frame,
+                "recovery_duration": recovery_duration,
+                "raw_score": raw_score
+            }
         }
-        # -----------------------------------------------------------
-        # TRACK LIVE
-        # -----------------------------------------------------------
 
     # -----------------------------------------------------------
     # BATCH OFFLINE PROCESSING & PROFILING
