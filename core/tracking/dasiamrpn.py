@@ -1,9 +1,9 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SiamRPN(nn.Module):
+class DaSiamRPN(nn.Module):
     def __init__(self, size=2, feature_out=512, anchor=5):
-        super(SiamRPN, self).__init__()
+        super(DaSiamRPN, self).__init__()
         configs = [3, 96, 256, 384, 384, 256]
         configs = list(map(lambda x: 3 if x == 3 else x * size, configs))
         feat_in = configs[-1]
@@ -90,7 +90,7 @@ class SiamRPN(nn.Module):
 
         return regress, cls
 
-class SiamRPNBIG(SiamRPN):
+class DaSiamRPNBIG(DaSiamRPN):
     cfg = {
         "lr": 0.295,
         "window_influence": 0.42,
@@ -103,7 +103,7 @@ class SiamRPNBIG(SiamRPN):
         super().__init__(size=2)
 
 
-class SiamRPNotb(SiamRPN):
+class DaSiamRPNotb(DaSiamRPN):
     cfg = {
         "lr": 0.30,
         "window_influence": 0.40,
