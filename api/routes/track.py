@@ -1,36 +1,20 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile, Form, File
-from pydantic import BaseModel
 import asyncio
-import base64
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, status
+import numpy as np
 import cv2
+import json
 import tempfile
 import shutil
-import numpy as np
-
-from services.tracking_service import (
-    create_tracker,
-    get_tracker,
-    reset_tracker,
-)
+from pathlib import Path
 
 router = APIRouter()
 
+# Create a dedicated thread pool for heavy CPU/GPU processing
+# This keeps the main async event loop completely free to handle network packets
+executor = ThreadPoolExecutor(max_workers=1)
 
-# ----------------------------------------------------------------------
-# Globals
-# ----------------------------------------------------------------------
-
-
-tracking_lock = asyncio.Lock()
-
-
-# ----------------------------------------------------------------------
-# Models
-# ----------------------------------------------------------------------
-
-class InitTrackResponse(BaseModel):
-    bbox: list[int]
-
+from services.tracking_service import create_tracker
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -42,107 +26,115 @@ def decode_image(file_bytes: bytes) -> np.ndarray:
         cv2.IMREAD_COLOR,
     )
 
-
-def decode_mask_b64(mask_b64: str) -> np.ndarray:
-    mask_bytes = base64.b64decode(mask_b64)
-    return cv2.imdecode(
-        np.frombuffer(mask_bytes, np.uint8),
-        cv2.IMREAD_GRAYSCALE,
-    )
-
-
 # ----------------------------------------------------------------------
-# Init
+# Unified Live Tracking (WebSocket)
 # ----------------------------------------------------------------------
-
-@router.post("/track/init", response_model=InitTrackResponse)
-async def init_track(file: UploadFile, mask_b64: str = Form(...)):
-    tracker = create_tracker()
-
-    frame = decode_image(await file.read())
-    mask = decode_mask_b64(mask_b64)
-
-    bbox = tracker.init_from_mask(frame, mask)
-
-    return InitTrackResponse(bbox=list(bbox))
-
-
-connection_lock = asyncio.Lock()
-active_tracking_task: asyncio.Task | None = None
-generation = 0
 
 @router.websocket("/track/live")
 async def track_live(websocket: WebSocket):
-    global active_tracking_task, generation
+    await websocket.accept()
 
-    async with connection_lock:
-        if active_tracking_task is not None and not active_tracking_task.done():
-            active_tracking_task.cancel()
-            try:
-                await active_tracking_task
-            except asyncio.CancelledError:
-                pass
+    # Instantiate a clean, isolated tracker session dedicated to this connection lifetime
+    loop = asyncio.get_running_loop()
+    tracker = await loop.run_in_executor(executor, create_tracker)
 
-        await websocket.accept()
-
-        tracker = get_tracker()
-        if not tracker.initialized:
-            await websocket.send_json({"error": "tracker not initialized"})
+    try:
+        # Step 1: Initialize Bounding Box Payload
+        init_message = await websocket.receive_text()
+        try:
+            init_data = json.loads(init_message)
+            bbox = tuple(init_data["bbox"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            await websocket.send_json({"error": "Invalid init payload."})
             await websocket.close()
             return
 
-        generation += 1
-        my_gen = generation
-        current_task = asyncio.current_task()
-        active_tracking_task = current_task
+        # Step 2: Await the first raw frame bytes
+        first_frame_bytes = await websocket.receive_bytes()
 
-    # ... loop body unchanged, but guard writes to shared state:
-    try:
+        # Offload image decoding to the thread pool
+        first_frame = await loop.run_in_executor(executor, decode_image, first_frame_bytes)
+        if first_frame is None:
+            await websocket.send_json({"error": "Failed to decode initial frame"})
+            await websocket.close()
+            return
+
+        # Offload model template initialization to the thread pool
+        await loop.run_in_executor(executor, tracker.init_from_bbox, first_frame, bbox)
+        await websocket.send_json({"status": "initialized", "bbox": list(bbox)})
+
+        # Step 3: High-Frequency Inference Streaming Loop
         while True:
             data = await websocket.receive_bytes()
-            frame = decode_image(data)
+
+            # Offload decoding to keep the socket read buffer clear
+            frame = await loop.run_in_executor(executor, decode_image, data)
             if frame is None:
                 await websocket.send_json({"error": "decode_image returned None"})
                 continue
 
-            async with tracking_lock:
-                if my_gen != generation:
-                    # someone superseded us between recv and lock acquisition
-                    break
-                result = tracker.track_step(frame)
+            # Offload the core neural net pass to the thread pool
+            result = await loop.run_in_executor(executor, tracker.track_step, frame)
 
+            # Send structured primitives back to client
             await websocket.send_json({
                 "bbox": result["bbox"],
                 "score": result["score"],
                 "lost": result["lost"],
-                "model_fps": result["model_fps"],
                 "tracker_fps": result["tracker_fps"],
                 "backend": result["backend"],
             })
+
+    except WebSocketDisconnect:
+        print("[INFO] Live tracking WebSocket disconnected client safely.")
     finally:
-        async with connection_lock:
-            if active_tracking_task is current_task:
-                active_tracking_task = None
+        # Explicit clean up step if your wrapper manages pinned CUDA buffers
+        if hasattr(tracker, 'reset'):
+            await loop.run_in_executor(executor, tracker.reset)
+            
+# ----------------------------------------------------------------------
+# Unified Offline Tracking (HTTP)
+# ----------------------------------------------------------------------
+@router.post("/track_video")
+async def track_video(
+    video: UploadFile = File(...),
+    bbox: str = Form(...)  # Expected JSON string: "[x, y, w, h]"
+):
+    try:
+        bbox_parsed = tuple(json.loads(bbox))
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid bbox format. Use JSON array '[x, y, w, h]'."
+        )
 
-@router.post("/offline_track")
-async def offline_track(video: UploadFile = File(...)):
-    tracker = get_tracker()
-
-    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as tmp:
+    # Write file out safely using a contextual block
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         shutil.copyfileobj(video.file, tmp)
         video_path = tmp.name
 
-    for _ in tracker.track_live(video_path, display=False):
-        pass
+    loop = asyncio.get_running_loop()
 
-    return {"status": "done"}
-# ----------------------------------------------------------------------
-# Reset
-# ----------------------------------------------------------------------
+    # Instantiating a distinct offline tracker instance prevents cross-talk with live sockets
+    track_video = await loop.run_in_executor(executor, create_tracker)
 
-@router.post("/track/reset")
-def reset():
-    reset_tracker()
+    try:
+        # Offload the entire blocking file profiling sweep to the thread pool
+        metrics = await loop.run_in_executor(
+            executor,
+            track_video.track_live,
+            video_path,
+            bbox_parsed,
+            False
+        )
+    finally:
+        track_video.reset()
+        # Clean up temporary disk storage footprint
+        path = Path(video_path)
+        if path.exists():
+            path.unlink()
+
     return {
-        "status": "tracker reset"
+        "status": "done",
+        "metrics": metrics
     }
