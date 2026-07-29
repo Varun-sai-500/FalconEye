@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 
-from core.utils.net import SiamRPNotb
+from core.tracking.dasiamrpn import DaSiamRPNotb
 
 torch.set_grad_enabled(False)
 
@@ -67,7 +67,7 @@ class TRTNet:
         r1_kernel = r1_kernel.contiguous().float()
         cls1_kernel = cls1_kernel.contiguous().float()
 
-        # on the caller's current stream) before it starts reading the tensors
+        # Wait on caller's current stream before reading tensors
         self.stream.wait_stream(torch.cuda.current_stream())
         self.context.set_tensor_address("search_crop", x_crop.data_ptr())
         self.context.set_tensor_address("r1_kernel", r1_kernel.data_ptr())
@@ -76,6 +76,7 @@ class TRTNet:
         self.context.set_tensor_address("classification", self.classification_buf.data_ptr())
         self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
         return self.regression_buf, self.classification_buf
+
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
         return self.forward(x_crop, r1_kernel, cls1_kernel)
 
@@ -119,7 +120,6 @@ class ONNXNet:
     def __init__(self, onnx_path, device=None):
         self.device = device or torch.device('cpu')
         if ORT_AVAILABLE and CUDA_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers():
-            # Get the current active CUDA stream pointer
             current_stream_ptr = torch.cuda.current_stream().cuda_stream
 
             providers = [
@@ -182,8 +182,6 @@ class ONNXNet:
 
             self.session.run_with_iobinding(self.io_binding)
 
-
-
             outs = self.io_binding.get_outputs()
             regression = torch.utils.dlpack.from_dlpack(outs[0].to_dlpack()) if hasattr(outs[0], "to_dlpack") \
                 else torch.as_tensor(outs[0].numpy(), device=self.device)
@@ -196,7 +194,6 @@ class ONNXNet:
 
             feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
             regression, classification = self.session.run(None, feeds)
-
 
             regression = torch.from_numpy(regression).to(self.device)
             classification = torch.from_numpy(classification).to(self.device)
@@ -237,9 +234,11 @@ class BackendManager:
             else 'cpu'
         )
 
-        self.pt_net = SiamRPNotb()
+        self.pt_net = DaSiamRPNotb()
         if os.path.exists(model_path):
             self.pt_net.load_state_dict(torch.load(model_path, map_location=self.device))
+
+        # Keep baseline setup clean in FP32; dynamic casting handles runtime alterations
         self.pt_net.eval().to(self.device)
         print(f"[INFO] Base PyTorch network mounted | device: {self.device}")
 
@@ -260,9 +259,17 @@ class BackendManager:
     def export_and_build(self, r1_kernel, cls1_kernel):
         assert r1_kernel.device == self.device
         assert cls1_kernel.device == self.device
+
+        # CRITICAL FIX: Ensure template parameters pass out of initialization as uniform FP32 tensors for stable ONNX/TRT trace steps
+        r1_kernel_fp32 = r1_kernel.float()
+        cls1_kernel_fp32 = cls1_kernel.float()
+
         if self.use_onnx and self.onnx_net is None:
             print(f"[INFO] Exporting search.onnx using real frame-0 target context tensors...")
-            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=torch.float32)
+
+            # PyTorch tracing requires standard FP32 execution blocks
+            self.pt_net.float()
 
             with torch.inference_mode():
                 onnx_dir = os.path.dirname(self.onnx_path)
@@ -270,7 +277,7 @@ class BackendManager:
                     os.makedirs(onnx_dir, exist_ok=True)
                 torch.onnx.export(
                     self.pt_net,
-                    (dummy_x, r1_kernel, cls1_kernel),
+                    (dummy_x, r1_kernel_fp32, cls1_kernel_fp32),
                     self.onnx_path,
                     export_params=True,
                     input_names=["search_crop", "r1_kernel", "cls1_kernel"],
@@ -299,19 +306,23 @@ class BackendManager:
                 except Exception as e:
                     print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
                     self.trt_net = None
+
         if self.benchmark:
-            # Re-create dummy_x safely here in case the ONNX block above was skipped
-            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size).to(self.device)
-            self.run_benchmark(dummy_x, r1_kernel, cls1_kernel)
+            # Re-create dummy_x safely using canonical floating-point representations
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=torch.float32)
+            self.run_benchmark(dummy_x, r1_kernel_fp32, cls1_kernel_fp32)
 
     def run_benchmark(self, x_crop, r1_kernel, cls1_kernel, iterations=300, warmup=30):
         net, name = self.active_net
         print(f"\n[BENCHMARK] Starting isolation sweep for active backend: {name}...")
 
+        # If benchmarking native PyTorch execution, guarantee model layer weights remain at FP32
+        if name == "PyTorch":
+            net.float()
+
         for _ in range(warmup):
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
 
-        # Clear the entire GPU pipeline before starting the real test
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
@@ -320,9 +331,6 @@ class BackendManager:
             t0 = time.perf_counter()
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
 
-            # ---------------------------------------------------------
-            # CRITICAL FIX: Wait for inference to finish before timing!
-            # ---------------------------------------------------------
             if self.device.type == "cuda":
                 if name == "TensorRT" and hasattr(net, 'stream'):
                     net.stream.synchronize()
