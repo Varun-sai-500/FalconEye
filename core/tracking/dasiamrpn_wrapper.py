@@ -221,105 +221,195 @@ class DaSiamRPNTracker:
         # TRACK LIVE
         # -----------------------------------------------------------
 
-    def track_live(self, video_src="input.mp4", display: bool = False):
-        if self.state is None:
-            raise RuntimeError("Call init_from_mask() before track_live()")
-
+    # -----------------------------------------------------------
+    # BATCH OFFLINE PROCESSING & PROFILING
+    # -----------------------------------------------------------
+    @torch.inference_mode()
+    def track_live(self, video_src: str, bbox: tuple[int, int, int, int], display: bool = False):
+        """
+        Processes a full video sequence sequentially.
+        Extracts the first frame to auto-initialize tracking using the provided bbox parameters.
+        Saves the resulting tracked video to the 'results' directory with isolated latency calculations.
+        """
         _, backend = self.backend.active_net
-        print(f"[INFO] track_live started | backend: {backend}")
+        print(f"[INFO] Headless benchmark started | Backend: {backend}")
 
         cap = cv2.VideoCapture(video_src)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {video_src}")
 
-        results_dir = Path("results")
-        results_dir.mkdir(exist_ok=True)
+        # --- Setup Video Writer Target ---
+        Path("results").mkdir(parents=True, exist_ok=True)
 
-        output_path = results_dir / f"{backend}_backend_tracked.mp4"
+        out_filename = f"{backend}_tracked_results.mp4"
+        out_filepath = str(Path("results") / out_filename)
+
         fps = cap.get(cv2.CAP_PROP_FPS)
-        fps = fps if fps > 0 else 30.0
+        if fps == 0 or np.isnan(fps):
+            fps = 30.0  # Safe fallback if metadata is missing
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
-        )
-        # ------------------------------------------------------
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(out_filepath, fourcc, fps, (width, height))
 
-        tracker_fps_sum = 0.0
-        model_fps_sum = 0.0
+        # --- Telemetry Profiles ---
+        latencies_ms = []
+        scores = []
+        lost_flags = []
+        bbox_history = []
+        tracklet_lengths = []
+        recovery_latencies = []
+
+        current_tracklet_len = 0
+        current_lost_len = 0
+        was_lost = False
         frames = 0
 
         try:
+            # Step 1: Handle first frame initialization natively
+            ret, first_frame = cap.read()
+            if not ret or first_frame is None:
+                raise RuntimeError("Failed to read the initial frame from the video source.")
+
+            # Anchor initial states (Mutates template but skips model inference)
+            self.init_from_bbox(first_frame, bbox)
+
+            # Log initial baseline metric frame
+            frames += 1
+            scores.append(1.0)
+            lost_flags.append(False)
+            bbox_history.append(bbox)
+            current_tracklet_len += 1
+
+            # Draw & write the initialization frame (Outside loop timing constraints)
+            draw_frame = first_frame.copy()
+            ix, iy, iw, ih = map(int, bbox)
+            cv2.rectangle(draw_frame, (ix, iy), (ix + iw, iy + ih), (0, 255, 0), 2)
+            writer.write(draw_frame)
+
+            # Step 2: Continuous batch inference loop for remaining frames
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
 
+                # === HIGH-PRECISION RUNTIME TIMING ZONE ===
+                t_start = time.perf_counter()
                 result = self.track_step(frame)
+                dt = (time.perf_counter() - t_start) * 1000.0
+                # ==========================================
 
-                tracker_fps_sum += result["tracker_fps"]
-                model_fps_sum += result["model_fps"]
+                # Immediately catch time metrics before doing any file I/O operations
+                latencies_ms.append(dt)
                 frames += 1
 
-                bbox = result["bbox"]
+                res_bbox = result["bbox"]
                 score = result["score"]
                 lost = result["lost"]
 
-                if lost:
-                    color = (0, 0, 255)
-                elif score >= self.CONF_THRESH:
-                    color = (0, 255, 0)
-                else:
-                    color = (0, 165, 255)
+                scores.append(score)
+                lost_flags.append(lost)
+                bbox_history.append(res_bbox if not lost else None)
 
+                # --- Defer Video Output Execution Tasks (Outside timing zone) ---
+                draw_frame = frame.copy()
                 if not lost:
-                    x, y, w, h = bbox
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    x, y, w, h = res_bbox
+                    cv2.rectangle(draw_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-                cv2.putText(
-                    frame,
-                    (
-                        f'{result["backend"]} | '
-                        f'Tracker:{result["tracker_fps"]:.0f} | '
-                        f'Model:{result["model_fps"]:.0f} | '
-                        f'S:{score:.2f}'
-                    ),
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    color,
-                    2,
-                )
+                writer.write(draw_frame)
 
-                writer.write(frame)
-
+                # Optional debug rendering loop
                 if display:
-                    cv2.imshow("DaSiamRPN", frame)
-                    if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
+                    cv2.imshow("Tracking Profile Loop", draw_frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
 
-                yield None if lost else result
-
+                # --- State Tracklet Diagnostics ---
+                if not lost:
+                    current_tracklet_len += 1
+                    if was_lost:
+                        recovery_latencies.append(current_lost_len)
+                        current_lost_len = 0
+                        was_lost = False
+                else:
+                    if current_tracklet_len > 0:
+                        tracklet_lengths.append(current_tracklet_len)
+                        current_tracklet_len = 0
+                    current_lost_len += 1
+                    was_lost = True
         finally:
             cap.release()
             writer.release()
-
             if display:
-                try:
-                    cv2.destroyAllWindows()
-                except cv2.error:
-                    pass
+                cv2.destroyAllWindows()
+            print(f"[INFO] Tracked video saved to: {out_filepath}")
 
-            print(f"[INFO] Saved tracked video to: {output_path}")
+        if current_tracklet_len > 0:
+            tracklet_lengths.append(current_tracklet_len)
 
-            if frames:
-                print("=" * 50)
-                print(f"Frames processed    : {frames}")
-                print(f"Average Tracker FPS : {tracker_fps_sum / frames:.2f}")
-                print(f"Average Model FPS   : {model_fps_sum / frames:.2f}")
-                print("=" * 50)
+        # --- Compute Analytics ---
+        if frames > 1:
+            latencies_ms = np.array(latencies_ms)
+            lost_flags = np.array(lost_flags)
+            lost_count = np.sum(lost_flags)
+            failure_rate = (lost_count / frames) * 100.0
+
+            jerk_deltas = []
+            prev_center = None
+            for b in bbox_history:
+                if b is not None:
+                    cx, cy = b[0] + b[2] / 2.0, b[1] + b[3] / 2.0
+                    if prev_center is not None:
+                        jerk_deltas.append(np.sqrt((cx - prev_center[0])**2 + (cy - prev_center[1])**2))
+                    prev_center = (cx, cy)
+                else:
+                    prev_center = None
+
+            avg_jerk = np.mean(jerk_deltas) if jerk_deltas else 0.0
+            p50 = np.median(latencies_ms)
+            p95 = np.percentile(latencies_ms, 95)
+            p99 = np.percentile(latencies_ms, 99)
+            jitter = np.std(latencies_ms)
+            mean_latency = np.mean(latencies_ms)
+
+            avg_tracklet = np.mean(tracklet_lengths) if tracklet_lengths else 0.0
+            max_tracklet = np.max(tracklet_lengths) if tracklet_lengths else 0
+            avg_recovery_frames = np.mean(recovery_latencies) if recovery_latencies else 0.0
+
+            print("\n" + "="*60)
+            print(f"    ROBOTICS METRIC PROFILING REPORT | BACKEND: {backend.upper()}   ")
+            print("="*60)
+            print(f"Total Video Frames Processed : {frames}")
+            print(f"Tracking Failure Rate        : {failure_rate:.2f}% ({lost_count}/{frames} frames)")
+            print(f"Average Tracking Score       : {np.mean(scores):.3f}")
+            print("-"*60)
+            print("LATENCY PROFILE (Deterministic Control Loop Constraints):")
+            print(f"  Mean Latency               : {mean_latency:.2f} ms ({1000.0/mean_latency:.2f} FPS)")
+            print(f"  Median (P50)               : {p50:.2f} ms")
+            print(f"  Tail Deadline (P95)        : {p95:.2f} ms")
+            print(f"  Worst-Case Outlier (P99)   : {p99:.2f} ms")
+            print(f"  Jitter (Standard Deviation): {jitter:.2f} ms")
+            print("-"*60)
+            print("TEMPORAL ROBUSTNESS & STABILITY:")
+            print(f"  Mean Tracklet Duration     : {avg_tracklet:.1f} continuous frames")
+            print(f"  Max Tracklet Duration      : {max_tracklet} frames")
+            print(f"  Avg Re-Localization Delay  : {avg_recovery_frames:.1f} frames to recover target")
+            print(f"  Kinematic Signal Noise     : {avg_jerk:.2f} px/frame (Avg center shift)")
+            print("="*60 + "\n")
+
+            return {
+                "backend": backend,
+                "p95_latency": p95,
+                "p99_latency": p99,
+                "jitter": jitter,
+                "failure_rate": failure_rate,
+                "avg_tracklet": avg_tracklet,
+                "avg_recovery_frames": avg_recovery_frames,
+                "jerkiness": avg_jerk,
+                "output_video": out_filepath
+            }
+
+        return {}
