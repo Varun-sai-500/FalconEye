@@ -1,127 +1,140 @@
-from fastapi import APIRouter, UploadFile, Form
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import APIRouter, UploadFile, Form, File, HTTPException, status
 from pydantic import BaseModel
 from typing import Optional
 import cv2
 import numpy as np
-import base64
 import json
-from fastapi import File
-from fastapi import HTTPException
 from enum import Enum
 
 from services.segmentation_service import sam_service, clipseg_service
-from core.utils.boundingbox import get_boundary
 
 router = APIRouter()
+
+# Global worker thread to serialize compute and isolate the CUDA context
+executor = ThreadPoolExecutor(max_workers=1)
 
 class SegmentMethod(str, Enum):
     click = "click"
     reference = "reference"
     text = "text"
 
-def validate_request(
-    frame_bgr: np.ndarray,
-    method: SegmentMethod,
-    points: Optional[str],
-    text: Optional[str],
-    ref_file: Optional[UploadFile],
-    ref_bgr: Optional[np.ndarray],
-) -> list | None:
-    if frame_bgr is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid input image."
-        )
-
-    if method == SegmentMethod.click:
-        if not points:
-            raise HTTPException(
-                status_code=400,
-                detail="Points are required for click mode."
-            )
-
-        try:
-            point_list = json.loads(points)
-        except json.JSONDecodeError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid points JSON."
-            )
-
-        return point_list
-
-    if method == SegmentMethod.reference:
-        if ref_file is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Reference image is required for reference mode."
-            )
-
-        if ref_bgr is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid reference image."
-            )
-
-    if method == SegmentMethod.text:
-        if not text or not text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Text is required for text mode."
-            )
-
-    return None
-
-
 class SegmentResponse(BaseModel):
-    mask_b64: str
-    bbox: Optional[tuple[int, int, int, int]] = None
+    bbox: tuple[int, int, int, int]
 
-def encode_mask(mask: np.ndarray) -> str:
-    mask = (mask.astype(np.uint8) * 255)
-    _, buf = cv2.imencode(".png", mask)
-    return base64.b64encode(buf).decode("utf-8")
+# ----------------------------------------------------------------------
+# Pure CPU/GPU Worker (Executes entirely off the main event loop)
+# ----------------------------------------------------------------------
 
-def decode_image(file_bytes: bytes) -> np.ndarray | None:
-    return cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
-
-@router.post("/segment", response_model=SegmentResponse)
-async def segment(
-    file: UploadFile,
-    method: SegmentMethod = Form(...),          # "click" | "reference" | "text"
-    points: Optional[str] = Form(None),  # JSON "[[x,y],...]" for click
-    text: Optional[str] = Form(None),     # for text mode
-    ref_file: Optional[UploadFile] = File(None),  # for reference mode
+def process_segmentation(
+    method: SegmentMethod,
+    frame_bytes: bytes,
+    ref_bytes: Optional[bytes],
+    points_str: Optional[str],
+    text_str: Optional[str]
 ):
-    frame_bgr = decode_image(await file.read())
+    # 1. Decode base image
+    frame_bgr = cv2.imdecode(np.frombuffer(frame_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if frame_bgr is None:
+        raise ValueError("Invalid input image encoding.")
+
+    # 2. Decode reference image if present
     ref_bgr = None
-    if ref_file is not None:
-        ref_bgr = decode_image(await ref_file.read())
+    if ref_bytes and len(ref_bytes) > 0:
+        ref_bgr = cv2.imdecode(np.frombuffer(ref_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if ref_bgr is None:
+            raise ValueError("Invalid reference image encoding.")
 
-    point_list = validate_request(
-        frame_bgr=frame_bgr,
-        method=method,
-        points=points,
-        text=text,
-        ref_file=ref_file,
-        ref_bgr=ref_bgr,
-    )
+    # 3. Structural Payload Validation
+    point_list = None
+    if method == SegmentMethod.click:
+        if not points_str:
+            raise ValueError("Points are required for click mode.")
+        try:
+            point_list = json.loads(points_str)
+        except json.JSONDecodeError:
+            raise ValueError("Invalid points JSON format.")
 
+    elif method == SegmentMethod.reference:
+        if ref_bytes is None or len(ref_bytes) == 0:
+            raise ValueError("Reference image is required for reference mode.")
+
+    elif method == SegmentMethod.text:
+        if not text_str or not text_str.strip():
+            raise ValueError("Non-empty text string is required for text mode.")
+
+    # 4. Color space transformation
     rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
+    # 5. Model Inference Core Pass
     if method == SegmentMethod.click:
-        mask = sam_service.predict_points(rgb_frame, point_list)
+        bbox = sam_service.predict(rgb_frame, point_list=point_list)
 
     elif method == SegmentMethod.reference:
         ref_rgb = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2RGB)
-        mask = clipseg_service.predict(rgb_frame, ref_image=ref_rgb)
+        bbox = clipseg_service.predict(rgb_frame, ref_image=ref_rgb)
 
     elif method == SegmentMethod.text:
-        mask = clipseg_service.predict(rgb_frame, text=text.strip())
+        bbox = clipseg_service.predict(rgb_frame, text=text_str.strip())
 
-    bbox, _ = get_boundary(mask, frame_bgr)
+    return bbox
+
+
+# ----------------------------------------------------------------------
+# Fluid Async Network Layer
+# ----------------------------------------------------------------------
+
+@router.post("/segment", response_model=SegmentResponse)
+async def segment(
+    file: UploadFile = File(...),
+    method: SegmentMethod = Form(...),
+    points: Optional[str] = Form(None),
+    text: Optional[str] = Form(None),
+    ref_file: Optional[UploadFile] = File(None),
+):
+    loop = asyncio.get_running_loop()
+
+    # Safety wrapper check against empty structural form items
+    try:
+        file_bytes = await file.read()
+
+        # Safely extract bytes from optional reference objects without event loop blocking
+        ref_bytes = None
+        if ref_file and ref_file.filename:
+            ref_bytes = await ref_file.read()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to read file payload components: {str(e)}"
+        )
+
+    try:
+        bbox = await loop.run_in_executor(
+            executor,
+            process_segmentation,
+            method,
+            file_bytes,
+            ref_bytes,
+            points,
+            text
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inference execution engine fault: {str(e)}"
+        )
+    finally:
+        # Clean up temporary spool descriptors immediately to clear RAM leaks
+        await file.close()
+        if ref_file:
+            await ref_file.close()
 
     return SegmentResponse(
-        mask_b64=encode_mask(mask),
-        bbox=bbox if bbox else None
+        bbox=bbox
     )
