@@ -10,9 +10,6 @@
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-005CED?style=for-the-badge&logo=onnx&logoColor=white)
 ![Jetson](https://img.shields.io/badge/NVIDIA-Jetson-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 
-<!-- <p align="center">
-  <img src="assets/demo.gif" alt="FalconEye Demo" width="900">
-</p> -->
 
 ## 📑 Table of Contents
 
