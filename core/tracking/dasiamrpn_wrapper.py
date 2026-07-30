@@ -35,21 +35,9 @@ class DaSiamRPNTracker:
             benchmark=True
         )
         self.device = self.backend.device
+        self._active_pt_net = None
         self._pinned_buffer: Optional[torch.Tensor] = None
-
-        # Determine optimal half-precision type based on device capability
-        if self.device.type == "cuda":
-            major, minor = torch.cuda.get_device_capability(self.device)
-            if major >= 8:
-                self.dtype = torch.bfloat16
-                print(f"[INFO] Compute capability {major}.{minor} >= 8.0 detected. Using bfloat16 precision.")
-            else:
-                self.dtype = torch.float16
-                print(f"[INFO] Compute capability {major}.{minor} < 8.0 detected. Using float16 precision.")
-        elif self.device.type == "mps":
-            self.dtype = torch.float16
-        else:
-            self.dtype = torch.float32
+        self.dtype = self.backend.dtype
 
         self.state           = None
         self.last_good_state = None
@@ -74,6 +62,7 @@ class DaSiamRPNTracker:
 
     def reset(self):
         self.state = None
+        self._active_pt_net = None
         self.last_good_state = None
         self.score_ema = None
         self.fps_ema = None
@@ -154,8 +143,15 @@ class DaSiamRPNTracker:
 
         # CRITICAL FIX: Ensure the PyTorch template extraction network matches the current session precision parameters
         net = self.backend.get_pt_net()
+
         if isinstance(net, torch.nn.Module):
-            net = net.to(device=self.device, dtype=self.dtype).eval()
+            if self._active_pt_net is None:
+                self._active_pt_net = net.to(
+                    device=self.device,
+                    dtype=self.dtype,
+                ).eval()
+
+        net = self._active_pt_net
 
         self.state = DaSiamRPN_init(
             im_t,
@@ -183,14 +179,14 @@ class DaSiamRPNTracker:
             raise RuntimeError("Call init_from_bbox() before track_step()")
 
         t0 = time.perf_counter()
-        active_net, backend = self.backend.active_net
 
         # CRITICAL FIX: If running tracking natively through PyTorch, cast network dynamically
-        if backend == "PyTorch" and isinstance(active_net, torch.nn.Module):
-            active_net = active_net.to(device=self.device, dtype=self.dtype).eval()
+        active_net, backend = self.backend.active_net
+
+        if backend == "PyTorch":
+            active_net = self._active_pt_net
 
         self.state["net"] = active_net
-
         im_t = self._frame_to_gpu(frame)
 
         # Execute forward pass within the targeted precision context
