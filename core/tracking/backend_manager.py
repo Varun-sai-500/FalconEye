@@ -2,7 +2,6 @@ import os
 import time
 import numpy as np
 import torch
-
 from core.tracking.dasiamrpn import DaSiamRPNotb
 
 torch.set_grad_enabled(False)
@@ -26,7 +25,7 @@ TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
 
 
 class TRTNet:
-    def __init__(self, engine_path, score_size, anchor_num, logger=None):
+    def __init__(self, engine_path, score_size, anchor_num, dtype=torch.float16, logger=None):
         self.logger = logger if logger is not None else trt.Logger(trt.Logger.WARNING)
         self.stream = torch.cuda.Stream()
 
@@ -35,14 +34,16 @@ class TRTNet:
 
         self.score_size = score_size
         self.anchor_num = anchor_num
+        self.dtype = dtype
 
+        # Pre-allocate output buffers natively using half-precision
         self.regression_buf = torch.empty(
-            (1, 4 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=torch.float32
+            (1, 4 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=self.dtype
         )
         self.classification_buf = torch.empty(
-            (1, 2 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=torch.float32
+            (1, 2 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=self.dtype
         )
-        print(f"[INFO] TRT engine initialized successfully | score_size={score_size}")
+        print(f"[INFO] TRT engine initialized successfully | score_size={score_size} | dtype={self.dtype}")
 
     def _load_engine(self, engine_path):
         runtime = trt.Runtime(self.logger)
@@ -63,9 +64,10 @@ class TRTNet:
         if r1_kernel.device != device: r1_kernel = r1_kernel.to(device, non_blocking=True)
         if cls1_kernel.device != device: cls1_kernel = cls1_kernel.to(device, non_blocking=True)
 
-        x_crop = x_crop.contiguous().float()
-        r1_kernel = r1_kernel.contiguous().float()
-        cls1_kernel = cls1_kernel.contiguous().float()
+        # Explicit low-precision memory continuity enforcement
+        x_crop = x_crop.contiguous().to(self.dtype)
+        r1_kernel = r1_kernel.contiguous().to(self.dtype)
+        cls1_kernel = cls1_kernel.contiguous().to(self.dtype)
 
         # Wait on caller's current stream before reading tensors
         self.stream.wait_stream(torch.cuda.current_stream())
@@ -81,8 +83,8 @@ class TRTNet:
         return self.forward(x_crop, r1_kernel, cls1_kernel)
 
     @staticmethod
-    def build_trt_engine(onnx_path, trt_path, workspace_size=1 << 30):
-        print(f"[INFO] Executing offline local TensorRT serialization engine compilation...")
+    def build_trt_engine(onnx_path, trt_path, workspace_size=1 << 30, dtype=torch.float16):
+        print(f"[INFO] Executing offline local TensorRT serialization engine compilation ({dtype})...")
         logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
 
@@ -101,6 +103,20 @@ class TRTNet:
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
 
+        # Enforce execution precision matching the PyTorch dtype
+        if dtype == torch.bfloat16:
+            if hasattr(trt.BuilderFlag, 'BF16'):
+                config.set_flag(trt.BuilderFlag.BF16)
+                print("[INFO] Target platform supports BF16 execution. Flag registered successfully.")
+            else:
+                print("[WARN] TensorRT version lacks BF16 builder flag; falling back to default precision.")
+        elif dtype == torch.float16:
+            if builder.platform_has_fast_fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
+                print("[INFO] Target platform supports FP16 execution. Flag registered successfully.")
+            else:
+                print("[WARN] Target hardware platform lacks optimized low-precision layers; falling back.")
+
         serialized_engine = builder.build_serialized_network(network, config)
         if serialized_engine is None:
             raise RuntimeError("TensorRT compilation interface returned null pointer.")
@@ -115,10 +131,17 @@ class TRTNet:
         os.replace(tmp_path, trt_path)
         print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{trt_path}'")
 
-
 class ONNXNet:
-    def __init__(self, onnx_path, device=None):
+    def __init__(self, onnx_path, device=None, dtype=torch.float16):
         self.device = device or torch.device('cpu')
+        self.dtype = dtype
+
+        # Resolve type maps between NumPy bindings and PyTorch configurations
+        if self.dtype == torch.bfloat16:
+            self.np_dtype = np.uint16  # Bfloat16 raw bits map to uint16 in structured memory buffers
+        else:
+            self.np_dtype = np.float16
+
         if ORT_AVAILABLE and CUDA_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers():
             current_stream_ptr = torch.cuda.current_stream().cuda_stream
 
@@ -152,7 +175,7 @@ class ONNXNet:
             name=name,
             device_type='cuda',
             device_id=tensor.device.index or 0,
-            element_type=np.float32,
+            element_type=self.np_dtype,
             shape=tuple(tensor.shape),
             buffer_ptr=tensor.data_ptr(),
         )
@@ -166,9 +189,9 @@ class ONNXNet:
             if r1_kernel.device != self.device: r1_kernel = r1_kernel.to(self.device, non_blocking=True)
             if cls1_kernel.device != self.device: cls1_kernel = cls1_kernel.to(self.device, non_blocking=True)
 
-            x_crop = x_crop.contiguous().float()
-            r1_kernel = r1_kernel.contiguous().float()
-            cls1_kernel = cls1_kernel.contiguous().float()
+            x_crop = x_crop.contiguous().to(self.dtype)
+            r1_kernel = r1_kernel.contiguous().to(self.dtype)
+            cls1_kernel = cls1_kernel.contiguous().to(self.dtype)
 
             self.io_binding.clear_binding_inputs()
             self.io_binding.clear_binding_outputs()
@@ -188,9 +211,9 @@ class ONNXNet:
             classification = torch.utils.dlpack.from_dlpack(outs[1].to_dlpack()) if hasattr(outs[1], "to_dlpack") \
                 else torch.as_tensor(outs[1].numpy(), device=self.device)
         else:
-            x_np = x_crop.cpu().numpy()
-            r1_np = r1_kernel.cpu().numpy()
-            cls1_np = cls1_kernel.cpu().numpy()
+            x_np = x_crop.cpu().to(self.dtype).numpy()
+            r1_np = r1_kernel.cpu().to(self.dtype).numpy()
+            cls1_np = cls1_kernel.cpu().to(self.dtype).numpy()
 
             feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
             regression, classification = self.session.run(None, feeds)
@@ -234,13 +257,22 @@ class BackendManager:
             else 'cpu'
         )
 
+        # Configure hardware-aware operational dtype configurations
+        if self.device.type == "cuda":
+            major, _ = torch.cuda.get_device_capability(self.device)
+            self.dtype = torch.bfloat16 if major >= 8 else torch.float16
+        elif self.device.type == "mps":
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
+
         self.pt_net = DaSiamRPNotb()
         if os.path.exists(model_path):
             self.pt_net.load_state_dict(torch.load(model_path, map_location=self.device))
 
-        # Keep baseline setup clean in FP32; dynamic casting handles runtime alterations
-        self.pt_net.eval().to(self.device)
-        print(f"[INFO] Base PyTorch network mounted | device: {self.device}")
+        # Mount baseline architecture converted directly to target precision
+        self.pt_net.eval().to(device=self.device, dtype=self.dtype)
+        print(f"[INFO] Base PyTorch network mounted | device: {self.device} | dtype: {self.dtype}")
 
         self.onnx_net = None
         self.trt_net  = None
@@ -260,24 +292,23 @@ class BackendManager:
         assert r1_kernel.device == self.device
         assert cls1_kernel.device == self.device
 
-        # CRITICAL FIX: Ensure template parameters pass out of initialization as uniform FP32 tensors for stable ONNX/TRT trace steps
-        r1_kernel_fp32 = r1_kernel.float()
-        cls1_kernel_fp32 = cls1_kernel.float()
+        # Maintain exact precision parameters across runtime contexts
+        r1_kernel_half = r1_kernel.to(self.dtype)
+        cls1_kernel_half = cls1_kernel.to(self.dtype)
 
         if self.use_onnx and self.onnx_net is None:
-            print(f"[INFO] Exporting search.onnx using real frame-0 target context tensors...")
-            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=torch.float32)
-
-            # PyTorch tracing requires standard FP32 execution blocks
-            self.pt_net.float()
+            print(f"[INFO] Exporting search.onnx using half precision context tensors...")
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=self.dtype)
 
             with torch.inference_mode():
                 onnx_dir = os.path.dirname(self.onnx_path)
                 if onnx_dir:
                     os.makedirs(onnx_dir, exist_ok=True)
+
+                # Trace execution blocks matching operational low-precision graphs
                 torch.onnx.export(
                     self.pt_net,
-                    (dummy_x, r1_kernel_fp32, cls1_kernel_fp32),
+                    (dummy_x, r1_kernel_half, cls1_kernel_half),
                     self.onnx_path,
                     export_params=True,
                     input_names=["search_crop", "r1_kernel", "cls1_kernel"],
@@ -290,35 +321,36 @@ class BackendManager:
             if TRT_AVAILABLE and not os.path.exists(self.trt_path):
                 try:
                     print("[WARN] Compiling TensorRT runtime workspace engine. This will block network threads...")
-                    TRTNet.build_trt_engine(self.onnx_path, self.trt_path)
+                    TRTNet.build_trt_engine(self.onnx_path, self.trt_path, dtype = self.dtype)
                 except Exception as e:
                     print(f"[WARN] TensorRT automatic compilation aborted: {e}")
 
-            self.onnx_net = ONNXNet(self.onnx_path, device=self.device)
+            self.onnx_net = ONNXNet(self.onnx_path, device=self.device, dtype=self.dtype)
 
             if self.use_trt and os.path.exists(self.trt_path):
                 try:
                     self.trt_net = TRTNet(
                         engine_path=self.trt_path,
                         score_size=self.score_size,
-                        anchor_num=self.anchor_num
+                        anchor_num=self.anchor_num,
+                        dtype=self.dtype
                     )
                 except Exception as e:
                     print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
                     self.trt_net = None
 
         if self.benchmark:
-            # Re-create dummy_x safely using canonical floating-point representations
-            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=torch.float32)
-            self.run_benchmark(dummy_x, r1_kernel_fp32, cls1_kernel_fp32)
+            dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=self.dtype)
+            self.run_benchmark(dummy_x, r1_kernel_half, cls1_kernel_half)
 
     def run_benchmark(self, x_crop, r1_kernel, cls1_kernel, iterations=300, warmup=30):
         net, name = self.active_net
         print(f"\n[BENCHMARK] Starting isolation sweep for active backend: {name}...")
 
-        # If benchmarking native PyTorch execution, guarantee model layer weights remain at FP32
-        if name == "PyTorch":
-            net.float()
+        # Prepare inputs exactly as they would be natively to skip conversion overhead in loop
+        x_crop = x_crop.contiguous().to(self.device, dtype=self.dtype)
+        r1_kernel = r1_kernel.contiguous().to(self.device, dtype=self.dtype)
+        cls1_kernel = cls1_kernel.contiguous().to(self.device, dtype=self.dtype)
 
         for _ in range(warmup):
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
@@ -326,18 +358,25 @@ class BackendManager:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
-        latencies = []
-        for _ in range(iterations):
-            t0 = time.perf_counter()
-            _, _ = net(x_crop, r1_kernel, cls1_kernel)
+            # Use CUDA Events for accurate GPU timing
+            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
 
-            if self.device.type == "cuda":
-                if name == "TensorRT" and hasattr(net, 'stream'):
-                    net.stream.synchronize()
-                else:
-                    torch.cuda.current_stream().synchronize()
+            for i in range(iterations):
+                start_events[i].record()
+                _, _ = net(x_crop, r1_kernel, cls1_kernel)
+                end_events[i].record()
 
-            latencies.append((time.perf_counter() - t0) * 1000.0)
+            torch.cuda.synchronize()
+            latencies = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+
+        else:
+            # Fallback for MPS / CPU
+            latencies = []
+            for _ in range(iterations):
+                t0 = time.perf_counter()
+                _, _ = net(x_crop, r1_kernel, cls1_kernel)
+                latencies.append((time.perf_counter() - t0) * 1000.0)
 
         avg_latency = np.mean(latencies)
         p99_latency = np.percentile(latencies, 99)
@@ -345,9 +384,9 @@ class BackendManager:
         self.model_fps = fps
 
         print(f"\n" + "="*60)
-        print(f" BENCHMARK RUNTIME REPORT: {name.upper()}")
+        print(f" BENCHMARK RUNTIME REPORT: {name.upper()} ({self.dtype})")
         print("="*60)
-        print(f" * Synchronized Host Call FPS : {fps:.2f} FPS")
-        print(f" * Avg Host-Synchronized Latency: {avg_latency:.3f} ms")
-        print(f" * P99 Tail Latency             : {p99_latency:.3f} ms")
+        print(f" * Pure Inference FPS : {fps:.2f} FPS")
+        print(f" * Avg GPU Latency    : {avg_latency:.3f} ms")
+        print(f" * P99 Tail Latency   : {p99_latency:.3f} ms")
         print("="*60 + "\n")
