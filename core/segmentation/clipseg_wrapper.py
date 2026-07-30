@@ -114,11 +114,16 @@ class CLIPSegWrapper:
         if torch.isinf(max_val):
             raise ValueError("CLIPSeg produced no valid local peaks.")
 
-        # Filter out weak background noise peaks that are far lower than the max peak
-        confidence_mask = suppressed_logits > (max_val - 2.0)
+        # --- FIX 1: Convert to probabilities to use rel_threshold ---
+        probs = torch.sigmoid(suppressed_logits.float())
+        max_prob = torch.max(probs)
+
+        confidence_mask = probs >= (max_prob * rel_threshold)
+
         suppressed_logits = torch.where(
             confidence_mask, suppressed_logits, torch.full_like(suppressed_logits, float("-inf"))
         )
+        # ------------------------------------------------------------
 
         # Dynamic Top-K Selection
         flat_logits = suppressed_logits.flatten()
@@ -140,8 +145,10 @@ class CLIPSegWrapper:
         scale_x = original_w / w_low
         scale_y = original_h / h_low
 
-        xs_orig = torch.round(xs_low.float() * scale_x).long()
-        ys_orig = torch.round(ys_low.float() * scale_y).long()
+        # --- FIX 2: Add 0.5 to center the point before scaling ---
+        xs_orig = torch.round((xs_low.float() + 0.5) * scale_x).long()
+        ys_orig = torch.round((ys_low.float() + 0.5) * scale_y).long()
+        # ---------------------------------------------------------
 
         xs_orig.clamp_(0, original_w - 1)
         ys_orig.clamp_(0, original_h - 1)
