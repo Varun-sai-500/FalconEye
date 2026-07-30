@@ -91,7 +91,7 @@ class SAMWrapper:
         reshaped_input_sizes = inputs["reshaped_input_sizes"]
 
         # Core SAM Inference Pass executing inside targeted autocast block
-        autocast_enabled = self.device.type in ["cuda", "cpu"]
+        autocast_enabled = self.device.type == "cuda"
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=autocast_enabled):
             outputs = self.model(**model_inputs)
 

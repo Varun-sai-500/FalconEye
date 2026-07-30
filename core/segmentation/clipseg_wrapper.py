@@ -64,7 +64,7 @@ class CLIPSegWrapper:
         }
 
         # Core Segmentation Inference Pass within the targeted autocast block
-        autocast_enabled = self.device.type in ["cuda", "cpu"]
+        autocast_enabled = self.device.type == "cuda"
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=autocast_enabled):
             outputs = self.model(**inputs)
             logits = outputs.logits[0]  # (H_low, W_low), e.g., 352x352

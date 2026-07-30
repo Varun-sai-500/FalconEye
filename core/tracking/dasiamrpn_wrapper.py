@@ -194,7 +194,7 @@ class DaSiamRPNTracker:
         im_t = self._frame_to_gpu(frame)
 
         # Execute forward pass within the targeted precision context
-        autocast_enabled = self.device.type in ["cuda", "cpu"]
+        autocast_enabled = self.device.type == "cuda"
         with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=autocast_enabled):
             self.state = DaSiamRPN_track(self.state, im_t)
 
