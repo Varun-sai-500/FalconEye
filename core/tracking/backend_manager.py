@@ -130,17 +130,19 @@ class TRTNet:
             f.write(serialized_engine)
         os.replace(tmp_path, trt_path)
         print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{trt_path}'")
-
 class ONNXNet:
     def __init__(self, onnx_path, device=None, dtype=torch.float16):
-        self.device = device or torch.device('cpu')
+        from onnx import TensorProto
+        self.device = device
         self.dtype = dtype
 
-        # Resolve type maps between NumPy bindings and PyTorch configurations
+        # Resolve type maps correctly using ONNX TensorProto for bfloat16
         if self.dtype == torch.bfloat16:
-            self.np_dtype = np.uint16  # Bfloat16 raw bits map to uint16 in structured memory buffers
+            self.ort_element_type = TensorProto.BFLOAT16
+        elif self.dtype == torch.float16:
+            self.ort_element_type = np.float16
         else:
-            self.np_dtype = np.float16
+            self.ort_element_type = np.float32
 
         if ORT_AVAILABLE and CUDA_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers():
             current_stream_ptr = torch.cuda.current_stream().cuda_stream
@@ -175,7 +177,7 @@ class ONNXNet:
             name=name,
             device_type='cuda',
             device_id=tensor.device.index or 0,
-            element_type=self.np_dtype,
+            element_type=self.ort_element_type,
             shape=tuple(tensor.shape),
             buffer_ptr=tensor.data_ptr(),
         )
@@ -352,30 +354,54 @@ class BackendManager:
         r1_kernel = r1_kernel.contiguous().to(self.device, dtype=self.dtype)
         cls1_kernel = cls1_kernel.contiguous().to(self.device, dtype=self.dtype)
 
+        # Warmup
         for _ in range(warmup):
             _, _ = net(x_crop, r1_kernel, cls1_kernel)
 
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
-            # Use CUDA Events for accurate GPU timing
-            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+            # TRT executes on its own CUDA stream; other backends use the current stream.
+            target_stream = (
+                net.stream
+                if hasattr(net, "stream")
+                else torch.cuda.current_stream(self.device)
+            )
+
+            start_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(iterations)
+            ]
+            end_events = [
+                torch.cuda.Event(enable_timing=True) for _ in range(iterations)
+            ]
 
             for i in range(iterations):
-                start_events[i].record()
+                start_events[i].record(target_stream)
                 _, _ = net(x_crop, r1_kernel, cls1_kernel)
-                end_events[i].record()
+                end_events[i].record(target_stream)
 
             torch.cuda.synchronize()
-            latencies = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+
+            latencies = [
+                s.elapsed_time(e)
+                for s, e in zip(start_events, end_events)
+            ]
 
         else:
-            # Fallback for MPS / CPU
+            # CPU / MPS timing
             latencies = []
+
             for _ in range(iterations):
+                if self.device.type == "mps":
+                    torch.mps.synchronize()
+
                 t0 = time.perf_counter()
+
                 _, _ = net(x_crop, r1_kernel, cls1_kernel)
+
+                if self.device.type == "mps":
+                    torch.mps.synchronize()
+
                 latencies.append((time.perf_counter() - t0) * 1000.0)
 
         avg_latency = np.mean(latencies)
@@ -383,10 +409,10 @@ class BackendManager:
         fps = 1000.0 / avg_latency if avg_latency > 0 else 0.0
         self.model_fps = fps
 
-        print(f"\n" + "="*60)
+        print("\n" + "=" * 60)
         print(f" BENCHMARK RUNTIME REPORT: {name.upper()} ({self.dtype})")
-        print("="*60)
+        print("=" * 60)
         print(f" * Pure Inference FPS : {fps:.2f} FPS")
         print(f" * Avg GPU Latency    : {avg_latency:.3f} ms")
         print(f" * P99 Tail Latency   : {p99_latency:.3f} ms")
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
