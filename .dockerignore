@@ -32,8 +32,7 @@ Thumbs.db
 *.dll
 *.so
 
-# weights
-
+# infernece graphs and engines
 *.onnx
 *.data
 *.engine
