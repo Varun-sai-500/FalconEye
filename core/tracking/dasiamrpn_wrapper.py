@@ -11,12 +11,12 @@ from .backend_manager import BackendManager
 
 class DaSiamRPNTracker:
     """
-    Stateless w.r.t. video I/O — caller feeds frames one at a time via track_step().
+    Stateless w.r.t. video I/O — caller feeds frames one at a time via tracking().
     track_live() is available for local webcam/file playback with cv2 display.
     One instance = one tracking session.
 
     Frames arrive as numpy BGR (from cv2/FastAPI upload) and are converted to a
-    CUDA/MPS half/bfloat16 tensor exactly once per call, at the top of init_from_bbox/track_step.
+    CUDA/MPS half/bfloat16 tensor exactly once per call, at the top of init_from_bbox/tracking.
     Everything downstream (pipeline.py) operates on that tensor with a single
     .cpu() sync per frame, inside tracker_eval.
     """
@@ -32,7 +32,7 @@ class DaSiamRPNTracker:
             onnx_path=onnx_path,
             trt_path=trt_path,
             use_onnx=use_onnx,
-            benchmark=True
+            benchmark=False
         )
         self.device = self.backend.device
         self._active_pt_net = None
@@ -174,9 +174,9 @@ class DaSiamRPNTracker:
     # TRACK STEP (Per-frame API pipeline)
     # -----------------------------------------------------------
     @torch.inference_mode()
-    def track_step(self, frame: np.ndarray) -> dict:
+    def tracking(self, frame: np.ndarray) -> dict:
         if self.state is None:
-            raise RuntimeError("Call init_from_bbox() before track_step()")
+            raise RuntimeError("Call init_from_bbox() before tracking()")
 
         t0 = time.perf_counter()
 
@@ -203,8 +203,10 @@ class DaSiamRPNTracker:
         elif self.device.type == "mps":
             torch.mps.synchronize()
 
-        raw_latency_ms = (time.perf_counter() - t0) * 1000.0
-        self.last_tracking_fps = 1000.0 / raw_latency_ms
+        tracking_latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Instantaneous FPS (UI only)
+        self.last_tracking_fps = 1000.0 / tracking_latency_ms
 
         raw_score = float(self.state.get("score", 1.0))
         if np.isnan(raw_score):
@@ -277,7 +279,7 @@ class DaSiamRPNTracker:
             "tracker_fps": float(self.fps_ema),
             "backend": backend,
             "metrics": {
-                "raw_latency_ms": raw_latency_ms,
+                "tracking_latency_ms": tracking_latency_ms,
                 "jerk_delta": jerk_delta,
                 "is_recovery": is_recovery_frame,
                 "recovery_duration": recovery_duration,
@@ -289,15 +291,12 @@ class DaSiamRPNTracker:
     # BATCH OFFLINE PROCESSING & PROFILING
     # -----------------------------------------------------------
     @torch.inference_mode()
-    def track_live(self, video_src: str, bbox: tuple[int, int, int, int], display: bool = False):
+    def track_offline(self, video_src: str, bbox: tuple[int, int, int, int], display: bool = False):
         """
         Processes a full video sequence sequentially.
         Extracts the first frame to auto-initialize tracking using the provided bbox parameters.
         Saves the resulting tracked video to the 'results' directory with isolated latency calculations.
         """
-        _, backend = self.backend.active_net
-        print(f"[INFO] Headless benchmark started | Backend: {backend}")
-
         cap = cv2.VideoCapture(video_src)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video source: {video_src}")
@@ -305,7 +304,7 @@ class DaSiamRPNTracker:
         # --- Setup Video Writer Target ---
         Path("results").mkdir(parents=True, exist_ok=True)
 
-        out_filename = f"{backend}_tracked_results.mp4"
+        out_filename = f"tracked_results.mp4"
         out_filepath = str(Path("results") / out_filename)
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -340,6 +339,9 @@ class DaSiamRPNTracker:
             # Anchor initial states (Mutates template but skips model inference)
             self.init_from_bbox(first_frame, bbox)
 
+            _, backend = self.backend.active_net
+            print(f"[INFO] Headless benchmark started | Backend: {backend}")
+
             # Log initial baseline metric frame
             frames += 1
             scores.append(1.0)
@@ -361,7 +363,7 @@ class DaSiamRPNTracker:
 
                 # === HIGH-PRECISION RUNTIME TIMING ZONE ===
                 t_start = time.perf_counter()
-                result = self.track_step(frame)
+                result = self.tracking(frame)
                 dt = (time.perf_counter() - t_start) * 1000.0
                 # ==========================================
 
@@ -416,7 +418,7 @@ class DaSiamRPNTracker:
 
         # --- Compute Analytics ---
         if frames > 1:
-            latencies_ms = np.array(latencies_ms)
+            latencies_ms = np.asarray(latencies_ms, dtype=np.float64)
             lost_flags = np.array(lost_flags)
             lost_count = np.sum(lost_flags)
             failure_rate = (lost_count / frames) * 100.0
@@ -433,47 +435,72 @@ class DaSiamRPNTracker:
                     prev_center = None
 
             avg_jerk = np.mean(jerk_deltas) if jerk_deltas else 0.0
-            p50 = np.median(latencies_ms)
-            p95 = np.percentile(latencies_ms, 95)
-            p99 = np.percentile(latencies_ms, 99)
-            jitter = np.std(latencies_ms)
-            mean_latency = np.mean(latencies_ms)
+            mean_latency = float(np.mean(latencies_ms))
+            median_latency = float(np.median(latencies_ms))
+            p95 = float(np.percentile(latencies_ms, 95))
+            p99 = float(np.percentile(latencies_ms, 99))
+            jitter = float(np.std(latencies_ms))
+            avg_tracking_fps = 1000.0 / mean_latency
+
 
             avg_tracklet = np.mean(tracklet_lengths) if tracklet_lengths else 0.0
             max_tracklet = np.max(tracklet_lengths) if tracklet_lengths else 0
             avg_recovery_frames = np.mean(recovery_latencies) if recovery_latencies else 0.0
 
-            print("\n" + "="*60)
-            print(f"    ROBOTICS METRIC PROFILING REPORT | BACKEND: {backend.upper()}   ")
-            print("="*60)
-            print(f"Total Video Frames Processed : {frames}")
-            print(f"Tracking Failure Rate        : {failure_rate:.2f}% ({lost_count}/{frames} frames)")
-            print(f"Average Tracking Score       : {np.mean(scores):.3f}")
-            print("-"*60)
-            print("LATENCY PROFILE (Deterministic Control Loop Constraints):")
-            print(f"  Mean Latency               : {mean_latency:.2f} ms ({1000.0/mean_latency:.2f} FPS)")
-            print(f"  Median (P50)               : {p50:.2f} ms")
-            print(f"  Tail Deadline (P95)        : {p95:.2f} ms")
-            print(f"  Worst-Case Outlier (P99)   : {p99:.2f} ms")
-            print(f"  Jitter (Standard Deviation): {jitter:.2f} ms")
-            print("-"*60)
-            print("TEMPORAL ROBUSTNESS & STABILITY:")
-            print(f"  Mean Tracklet Duration     : {avg_tracklet:.1f} continuous frames")
-            print(f"  Max Tracklet Duration      : {max_tracklet} frames")
-            print(f"  Avg Re-Localization Delay  : {avg_recovery_frames:.1f} frames to recover target")
-            print(f"  Kinematic Signal Noise     : {avg_jerk:.2f} px/frame (Avg center shift)")
-            print("="*60 + "\n")
+        print("\n" + "=" * 60)
+        print(f"ROBOTICS TRACKING PROFILING | {backend.upper()}")
+        print("=" * 60)
 
-            return {
-                "backend": backend,
-                "p95_latency": p95,
-                "p99_latency": p99,
-                "jitter": jitter,
+        print("ENVIRONMENT")
+        print(f"  Backend                : {backend}")
+        print(f"  Device                 : {self.backend.device_name}")
+        print(f"  Precision              : {str(self.backend.dtype).replace('torch.', '')}")
+        print(f"  Frames                 : {frames}")
+
+        print("-" * 60)
+        print("PERFORMANCE")
+        print(f"  Effective FPS          : {avg_tracking_fps:.2f}")
+        print(f"  Mean Latency           : {mean_latency:.2f} ms")
+        print(f"  Median Latency         : {median_latency:.2f} ms")
+        print(f"  P95 Latency            : {p95:.2f} ms")
+        print(f"  P99 Latency            : {p99:.2f} ms")
+        print(f"  Jitter                : {jitter:.2f} ms")
+
+        print("-" * 60)
+        print("TRACKING QUALITY")
+        print(f"  Failure Rate           : {failure_rate:.2f}% ({lost_count}/{frames})")
+        print(f"  Mean Confidence        : {np.mean(scores):.3f}")
+        print(f"  Mean Tracklet          : {avg_tracklet:.1f} frames")
+        print(f"  Max Tracklet           : {max_tracklet} frames")
+        print(f"  Mean Recovery          : {avg_recovery_frames:.1f} frames")
+        print(f"  Mean Motion Jitter     : {avg_jerk:.2f} px/frame")
+
+        print("=" * 60 + "\n")
+
+        return {
+            "backend": backend,
+            "device": self.backend.device_name,
+            "precision": str(self.backend.dtype).replace("torch.", ""),
+
+            "performance": {
+                "fps": avg_tracking_fps,
+                "latency": {
+                    "mean_ms": mean_latency,
+                    "p50_ms": median_latency,
+                    "p95_ms": p95,
+                    "p99_ms": p99,
+                    "jitter_ms": jitter,
+                },
+            },
+
+            "tracking": {
                 "failure_rate": failure_rate,
                 "avg_tracklet": avg_tracklet,
+                "max_tracklet": int(max_tracklet),
                 "avg_recovery_frames": avg_recovery_frames,
-                "jerkiness": avg_jerk,
-                "output_video": out_filepath
-            }
+                "avg_score": float(np.mean(scores)),
+                "avg_jerk_px": avg_jerk,
+            },
 
-        return {}
+            "output_video": out_filepath,
+        }
