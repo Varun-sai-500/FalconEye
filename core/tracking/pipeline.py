@@ -20,55 +20,91 @@ class TrackerConfig(object):
     lr = 0.295
     adaptive = True
 
+
     def update(self, cfg):
         for k, v in cfg.items():
             setattr(self, k, v)
         self.score_size = (self.instance_size - self.exemplar_size) // self.total_stride + 1
 
+def tracker_geometry_update(
+    delta,
+    score,
+    anchor,
+    target_sz,
+    target_pos,
+    window,
+    scale_z,
+    penalty_k,
+    window_influence,
+    lr_coef,
+):
 
-def tracker_eval(net, x_crop, r1_kernel, cls1_kernel, target_pos, target_sz, window, scale_z, p):
-    target_dtype = x_crop.dtype  # Dynamically capture current running type (BFloat16/Float32)
-
-    delta, score = net(x_crop, r1_kernel, cls1_kernel)
-    delta = delta.permute(1, 2, 3, 0).contiguous().view(4, -1)
-    score = F.softmax(score.permute(1, 2, 3, 0).contiguous().view(2, -1), dim=0)[1, :]
-
-    # Ensure anchor tensors dynamically match network output dtype
-    anchor_t = p.anchor.to(dtype=target_dtype)
-
-    cx = delta[0, :] * anchor_t[:, 2] + anchor_t[:, 0]
-    cy = delta[1, :] * anchor_t[:, 3] + anchor_t[:, 1]
-    w = torch.exp(delta[2, :]) * anchor_t[:, 2]
-    h = torch.exp(delta[3, :]) * anchor_t[:, 3]
+    cx = (delta[0] * anchor[:, 2] + anchor[:, 0]).to(anchor.dtype)
+    cy = (delta[1] * anchor[:, 3] + anchor[:, 1]).to(anchor.dtype)
+    w  = (torch.exp(delta[2]) * anchor[:, 2]).to(anchor.dtype)
+    h  = (torch.exp(delta[3]) * anchor[:, 3]).to(anchor.dtype)
 
     def change(r):
-        return torch.max(r, 1.0 / r)
+        return torch.maximum(r, 1.0 / r)
 
     def sz(w_val, h_val):
         pad = (w_val + h_val) * 0.5
         return torch.sqrt((w_val + pad) * (h_val + pad))
 
-    s_c = change(sz(w, h) / sz(target_sz[0], target_sz[1]))
-    r_c = change((target_sz[0] / target_sz[1]) / (w / h))
+    s_c = change(
+        sz(w, h) /
+        sz(target_sz[0], target_sz[1])
+    )
 
-    # Match literal scales to precision
-    penalty = torch.exp(-(r_c * s_c - 1.0) * p.penalty_k)
+    r_c = change(
+        (target_sz[0] / target_sz[1]) /
+        (w / h)
+    )
+
+    penalty = torch.exp(
+        -(r_c * s_c - 1.0) * penalty_k
+    )
+
     pscore = penalty * score
-    pscore = pscore * (1.0 - p.window_influence) + window.to(dtype=target_dtype) * p.window_influence
-    best_pscore_id = torch.argmax(pscore)
 
-    lr = penalty[best_pscore_id] * score[best_pscore_id] * p.lr
+    pscore = (
+        pscore * (1.0 - window_influence)
+        +
+        window * window_influence
+    )
 
-    res_x = cx[best_pscore_id] / scale_z + target_pos[0]
-    res_y = cy[best_pscore_id] / scale_z + target_pos[1]
-    res_w = target_sz[0] / scale_z * (1.0 - lr) + (w[best_pscore_id] / scale_z) * lr
-    res_h = target_sz[1] / scale_z * (1.0 - lr) + (h[best_pscore_id] / scale_z) * lr
+    best = torch.argmax(pscore)
 
-    target_pos = torch.stack([res_x, res_y])
-    target_sz = torch.stack([res_w, res_h])
-    return target_pos, target_sz, score[best_pscore_id]
+    lr = (
+        penalty[best]
+        *
+        score[best]
+        *
+        lr_coef
+    )
 
+    res_x = cx[best] / scale_z + target_pos[0]
+    res_y = cy[best] / scale_z + target_pos[1]
 
+    res_w = (
+        target_sz[0] / scale_z * (1.0 - lr)
+        +
+        w[best] / scale_z * lr
+    )
+
+    res_h = (
+        target_sz[1] / scale_z * (1.0 - lr)
+        +
+        h[best] / scale_z * lr
+    )
+
+    return (
+        torch.stack([res_x, res_y]),
+        torch.stack([res_w, res_h]),
+        score[best]
+    )
+
+@torch.inference_mode()
 def DaSiamRPN_init(im, target_pos, target_sz, net):
     device = im.device
     target_dtype = im.dtype  # Capture image array entry type context
@@ -78,17 +114,22 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
 
     state['im_h'] = im.shape[0]
     state['im_w'] = im.shape[1]
-
-    # Initialize coordinate tracking values to target precision format
-    if not isinstance(target_pos, torch.Tensor):
-        target_pos = torch.tensor(target_pos, dtype=target_dtype, device=device)
+    if device.type == "cpu":
+        state["geometry"] = tracker_geometry_update
     else:
-        target_pos = target_pos.to(dtype=target_dtype, device=device)
+        state["geometry"] = torch.compile(
+            tracker_geometry_update,
+            mode="reduce-overhead",
+        )
+    if not isinstance(target_pos, torch.Tensor):
+        target_pos = torch.tensor(target_pos, dtype=torch.float32, device=device)
+    else:
+        target_pos = target_pos.to(dtype=torch.float32, device=device)
 
     if not isinstance(target_sz, torch.Tensor):
-        target_sz = torch.tensor(target_sz, dtype=target_dtype, device=device)
+        target_sz = torch.tensor(target_sz, dtype=torch.float32, device=device)
     else:
-        target_sz = target_sz.to(dtype=target_dtype, device=device)
+        target_sz = target_sz.to(dtype=torch.float32, device=device)
 
     if p.adaptive:
         if ((target_sz[0] * target_sz[1]) / float(state['im_h'] * state['im_w'])) < 0.004:
@@ -98,8 +139,14 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
         p.score_size = (p.instance_size - p.exemplar_size) // p.total_stride + 1
 
     # Keep structural generation floating point, cast down inside runtime loops
-    p.anchor = generate_anchors(p.total_stride, p.scales, p.ratios, int(p.score_size), device=device)
-
+    p.anchor = generate_anchors(
+        p.total_stride,
+        p.scales,
+        p.ratios,
+        int(p.score_size),
+        device=device,
+        dtype=torch.float32
+    )
     avg_chans = im.mean(dim=(0, 1))
 
     cropper_z = SubwindowCropper(model_sz=p.exemplar_size, device=device)
@@ -117,6 +164,8 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
 
     state["r1_kernel"] = r1_kernel
     state["cls1_kernel"] = cls1_kernel
+    state["anchor"] = p.anchor.to(dtype=r1_kernel.dtype)
+
 
     if p.windowing == 'cosine':
         hanning_1d = torch.hann_window(int(p.score_size), periodic=False, device=device, dtype=target_dtype)
@@ -133,22 +182,18 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
     state['target_sz'] = target_sz
     return state
 
-
+@torch.inference_mode()
 def DaSiamRPN_track(state, im):
     p = state['p']
     net = state['net']
     avg_chans = state['avg_chans']
     window = state['window']
+    anchor = state['anchor']
     target_pos = state['target_pos']
     target_sz = state['target_sz']
-    target_dtype = im.dtype
 
     r1_kernel = state["r1_kernel"]
     cls1_kernel = state["cls1_kernel"]
-
-    # Align state geometry constants to current input array frame data layout
-    target_pos = target_pos.to(dtype=target_dtype)
-    target_sz = target_sz.to(dtype=target_dtype)
 
     wc_z = target_sz[1] + p.context_amount * target_sz.sum()
     hc_z = target_sz[0] + p.context_amount * target_sz.sum()
@@ -162,8 +207,31 @@ def DaSiamRPN_track(state, im):
     cropper_x = state['cropper_x']
     x_crop = cropper_x.crop(im, target_pos, s_x, avg_chans)
 
-    target_pos, target_sz, score = tracker_eval(
-        net, x_crop, r1_kernel, cls1_kernel, target_pos, target_sz * scale_z, window, scale_z, p
+    delta, score = net(
+        x_crop,
+        r1_kernel,
+        cls1_kernel
+    )
+    delta = delta.permute(1,2,3,0).contiguous().view(4,-1)
+
+    score = F.softmax(
+        score.permute(1,2,3,0)
+        .contiguous()
+        .view(2,-1),
+        dim=0
+    )[1]
+
+    target_pos, target_sz, score = state["geometry"](
+        delta,
+        score,
+        anchor,
+        target_sz * scale_z,
+        target_pos,
+        window,
+        scale_z,
+        p.penalty_k,
+        p.window_influence,
+        p.lr,
     )
 
     # Force continuous floating points for target geometry clamp limits
