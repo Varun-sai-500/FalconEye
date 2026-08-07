@@ -1,12 +1,12 @@
 torch
 torchvision
-opencv-python
 transformers
-PySide6
+opencv-python-headless
 fastapi
 uvicorn
-python-multipart
-requests
+av
 websockets
+python-multipart
+pyside6
 onnxruntime
 onnxscript

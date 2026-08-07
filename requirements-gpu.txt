@@ -1,12 +1,12 @@
 # install torch and torchvision according to your machine
-opencv-python
 transformers
-PySide6
+opencv-python-headless
 fastapi
 uvicorn
-python-multipart
-requests
+av
 websockets
+python-multipart
+pyside6
 onnxruntime-gpu
 onnxscript
 tensorrt
