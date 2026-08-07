@@ -17,6 +17,7 @@ myvenv/
 ENV/
 
 # --- Model weights / checkpoints ---
+weights/
 ckpt/
 *.pt
 *.pth
@@ -26,6 +27,8 @@ ckpt/
 # OS junk
 .DS_Store
 Thumbs.db
+
+results/
 
 # Binaries
 *.exe
