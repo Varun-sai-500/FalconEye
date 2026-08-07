@@ -25,23 +25,27 @@ TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
 
 
 class TRTNet:
-    def __init__(self, engine_path, score_size, anchor_num, dtype=torch.float16, logger=None):
+    def __init__(self, engine_path, score_size, anchor_num, device, dtype=torch.float16, logger=None):
         self.logger = logger if logger is not None else trt.Logger(trt.Logger.WARNING)
-        self.stream = torch.cuda.Stream()
-
         self.engine = self._load_engine(engine_path)
         self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError(
+                "Failed to create TensorRT execution context."
+            )
 
         self.score_size = score_size
         self.anchor_num = anchor_num
+        self.device = device
         self.dtype = dtype
+        self._validate_engine()
 
-        # Pre-allocate output buffers natively using half-precision
+        # Pre-allocate output buffers natively on target device
         self.regression_buf = torch.empty(
-            (1, 4 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=self.dtype
+            (1, 4 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype
         )
         self.classification_buf = torch.empty(
-            (1, 2 * anchor_num, score_size, score_size), device=torch.device("cuda"), dtype=self.dtype
+            (1, 2 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype
         )
         print(f"[INFO] TRT engine initialized successfully | score_size={score_size} | dtype={self.dtype}")
 
@@ -57,26 +61,73 @@ class TRTNet:
             raise RuntimeError("Failed to deserialize TensorRT engine.")
         return engine
 
+    def _validate_engine(self):
+        expected_dtype = (
+            trt.DataType.BF16
+            if self.dtype == torch.bfloat16
+            else trt.DataType.HALF
+        )
+
+        expected = {
+            "search_crop": trt.TensorIOMode.INPUT,
+            "r1_kernel": trt.TensorIOMode.INPUT,
+            "cls1_kernel": trt.TensorIOMode.INPUT,
+            "regression": trt.TensorIOMode.OUTPUT,
+            "classification": trt.TensorIOMode.OUTPUT,
+        }
+
+        available = {
+            self.engine.get_tensor_name(i)
+            for i in range(self.engine.num_io_tensors)
+        }
+
+        missing = set(expected) - available
+        if missing:
+            raise RuntimeError(
+                f"Missing engine tensors: {sorted(missing)}"
+            )
+
+        for name, expected_mode in expected.items():
+            mode = self.engine.get_tensor_mode(name)
+            dtype = self.engine.get_tensor_dtype(name)
+
+            if mode != expected_mode:
+                raise RuntimeError(
+                    f"{name}: expected {expected_mode.name}, got {mode.name}"
+                )
+
+            if dtype != expected_dtype:
+                raise RuntimeError(
+                    f"{name}: expected {expected_dtype.name}, got {dtype.name}"
+                )
+            shape = tuple(self.engine.get_tensor_shape(name))
+
+            print(
+                f"[OK] {name:15}"
+                f"{mode.name:6}"
+                f"{dtype.name:6}"
+                f"{shape}"
+            )
+
     @torch.inference_mode()
     def forward(self, x_crop, r1_kernel, cls1_kernel):
-        device = self.regression_buf.device
-        if x_crop.device != device: x_crop = x_crop.to(device, non_blocking=True)
-        if r1_kernel.device != device: r1_kernel = r1_kernel.to(device, non_blocking=True)
-        if cls1_kernel.device != device: cls1_kernel = cls1_kernel.to(device, non_blocking=True)
+        # Cast inputs straight to execution stream
+        x_crop = x_crop.contiguous().to(self.device, dtype=self.dtype)
+        r1_kernel = r1_kernel.contiguous().to(self.device, dtype=self.dtype)
+        cls1_kernel = cls1_kernel.contiguous().to(self.device, dtype=self.dtype)
 
-        # Explicit low-precision memory continuity enforcement
-        x_crop = x_crop.contiguous().to(self.dtype)
-        r1_kernel = r1_kernel.contiguous().to(self.dtype)
-        cls1_kernel = cls1_kernel.contiguous().to(self.dtype)
+        # Zero-copy execution via direct PyTorch stream interaction
+        current_stream = torch.cuda.current_stream().cuda_stream
 
-        # Wait on caller's current stream before reading tensors
-        self.stream.wait_stream(torch.cuda.current_stream())
         self.context.set_tensor_address("search_crop", x_crop.data_ptr())
         self.context.set_tensor_address("r1_kernel", r1_kernel.data_ptr())
         self.context.set_tensor_address("cls1_kernel", cls1_kernel.data_ptr())
         self.context.set_tensor_address("regression", self.regression_buf.data_ptr())
         self.context.set_tensor_address("classification", self.classification_buf.data_ptr())
-        self.context.execute_async_v3(stream_handle=self.stream.cuda_stream)
+
+        if not self.context.execute_async_v3(stream_handle=current_stream):
+            raise RuntimeError("TensorRT execute_async_v3() failed.")
+
         return self.regression_buf, self.classification_buf
 
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
@@ -88,13 +139,10 @@ class TRTNet:
         logger = trt.Logger(trt.Logger.INFO)
         builder = trt.Builder(logger)
 
-        if hasattr(trt.NetworkDefinitionCreationFlag, 'EXPLICIT_BATCH'):
-            flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-            network = builder.create_network(flags)
-        else:
-            network = builder.create_network()
-
+        # TensorRT 10/11 implicitly uses EXPLICIT_BATCH; create_network() needs no extra flags
+        network = builder.create_network()
         parser = trt.OnnxParser(network, logger)
+
         if not parser.parse_from_file(onnx_path):
             for i in range(parser.num_errors):
                 print(f"[ONNX Parser Error]: {parser.get_error(i)}")
@@ -103,20 +151,7 @@ class TRTNet:
         config = builder.create_builder_config()
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
 
-        # Enforce execution precision matching the PyTorch dtype
-        if dtype == torch.bfloat16:
-            if hasattr(trt.BuilderFlag, 'BF16'):
-                config.set_flag(trt.BuilderFlag.BF16)
-                print("[INFO] Target platform supports BF16 execution. Flag registered successfully.")
-            else:
-                print("[WARN] TensorRT version lacks BF16 builder flag; falling back to default precision.")
-        elif dtype == torch.float16:
-            if builder.platform_has_fast_fp16:
-                config.set_flag(trt.BuilderFlag.FP16)
-                print("[INFO] Target platform supports FP16 execution. Flag registered successfully.")
-            else:
-                print("[WARN] Target hardware platform lacks optimized low-precision layers; falling back.")
-
+        print(f"[INFO] Building TensorRT engine (requested dtype={dtype})")
         serialized_engine = builder.build_serialized_network(network, config)
         if serialized_engine is None:
             raise RuntimeError("TensorRT compilation interface returned null pointer.")
@@ -130,13 +165,14 @@ class TRTNet:
             f.write(serialized_engine)
         os.replace(tmp_path, trt_path)
         print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{trt_path}'")
+
+
 class ONNXNet:
-    def __init__(self, onnx_path, device=None, dtype=torch.float16):
+    def __init__(self, onnx_path, score_size, anchor_num,device, dtype=torch.float16):
         from onnx import TensorProto
         self.device = device
         self.dtype = dtype
 
-        # Resolve type maps correctly using ONNX TensorProto for bfloat16
         if self.dtype == torch.bfloat16:
             self.ort_element_type = TensorProto.BFLOAT16
         elif self.dtype == torch.float16:
@@ -144,11 +180,11 @@ class ONNXNet:
         else:
             self.ort_element_type = np.float32
 
-        if ORT_AVAILABLE and CUDA_AVAILABLE and 'CUDAExecutionProvider' in ort.get_available_providers():
+        if ORT_AVAILABLE and CUDA_AVAILABLE:
             current_stream_ptr = torch.cuda.current_stream().cuda_stream
-
             providers = [
                 ('CUDAExecutionProvider', {
+                    'device_id': '0',
                     'user_compute_stream': str(current_stream_ptr)
                 }),
                 'CPUExecutionProvider'
@@ -170,48 +206,55 @@ class ONNXNet:
         if self.using_cuda:
             self.io_binding = self.session.io_binding()
 
-        print(f"[INFO] ONNX session initialized | provider: {self.session.get_providers()[0]}")
+            # Pre-allocate output buffers permanently
+            self.reg_buf = torch.empty((1, 4 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype)
+            self.cls_buf = torch.empty((1, 2 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype)
 
-    def _helper_bind_tensor(self, name, tensor):
-        self.io_binding.bind_input(
-            name=name,
-            device_type='cuda',
-            device_id=tensor.device.index or 0,
-            element_type=self.ort_element_type,
-            shape=tuple(tensor.shape),
-            buffer_ptr=tensor.data_ptr(),
-        )
+            # TRUE ZERO-COPY: Bind outputs permanently right here in init
+            self.io_binding.bind_output(
+                name=self.output_names[0], device_type='cuda', device_id=0,
+                element_type=self.ort_element_type, shape=tuple(self.reg_buf.shape),
+                buffer_ptr=self.reg_buf.data_ptr()
+            )
+            self.io_binding.bind_output(
+                name=self.output_names[1], device_type='cuda', device_id=0,
+                element_type=self.ort_element_type, shape=tuple(self.cls_buf.shape),
+                buffer_ptr=self.cls_buf.data_ptr()
+            )
+
+        print(f"[INFO] ONNX session initialized | provider: {self.session.get_providers()[0]}")
 
     def __call__(self, x_crop, r1_kernel, cls1_kernel):
         if not torch.is_tensor(x_crop):
             x_crop = torch.from_numpy(x_crop).to(self.device)
 
         if self.using_cuda:
-            if x_crop.device != self.device: x_crop = x_crop.to(self.device, non_blocking=True)
-            if r1_kernel.device != self.device: r1_kernel = r1_kernel.to(self.device, non_blocking=True)
-            if cls1_kernel.device != self.device: cls1_kernel = cls1_kernel.to(self.device, non_blocking=True)
+            x_crop = x_crop.contiguous().to(device=self.device, dtype=self.dtype)
+            r1_kernel = r1_kernel.contiguous().to(device=self.device, dtype=self.dtype)
+            cls1_kernel = cls1_kernel.contiguous().to(device=self.device, dtype=self.dtype)
 
-            x_crop = x_crop.contiguous().to(self.dtype)
-            r1_kernel = r1_kernel.contiguous().to(self.dtype)
-            cls1_kernel = cls1_kernel.contiguous().to(self.dtype)
-
+            # Clean only the changing input registers
             self.io_binding.clear_binding_inputs()
-            self.io_binding.clear_binding_outputs()
 
-            self._helper_bind_tensor(self.search_name, x_crop)
-            self._helper_bind_tensor(self.r1_name, r1_kernel)
-            self._helper_bind_tensor(self.cls1_name, cls1_kernel)
-
-            for name in self.output_names:
-                self.io_binding.bind_output(name, device_type='cuda', device_id=x_crop.device.index or 0)
-
+            # Dynamic input mappings
+            self.io_binding.bind_input(
+                name=self.search_name, device_type='cuda', device_id=0,
+                element_type=self.ort_element_type, shape=tuple(x_crop.shape),
+                buffer_ptr=x_crop.data_ptr()
+            )
+            self.io_binding.bind_input(
+                name=self.r1_name, device_type='cuda', device_id=0,
+                element_type=self.ort_element_type, shape=tuple(r1_kernel.shape),
+                buffer_ptr=r1_kernel.data_ptr()
+            )
+            self.io_binding.bind_input(
+                name=self.cls1_name, device_type='cuda', device_id=0,
+                element_type=self.ort_element_type, shape=tuple(cls1_kernel.shape),
+                buffer_ptr=cls1_kernel.data_ptr()
+            )
             self.session.run_with_iobinding(self.io_binding)
 
-            outs = self.io_binding.get_outputs()
-            regression = torch.utils.dlpack.from_dlpack(outs[0].to_dlpack()) if hasattr(outs[0], "to_dlpack") \
-                else torch.as_tensor(outs[0].numpy(), device=self.device)
-            classification = torch.utils.dlpack.from_dlpack(outs[1].to_dlpack()) if hasattr(outs[1], "to_dlpack") \
-                else torch.as_tensor(outs[1].numpy(), device=self.device)
+            return self.reg_buf, self.cls_buf
         else:
             x_np = x_crop.cpu().to(self.dtype).numpy()
             r1_np = r1_kernel.cpu().to(self.dtype).numpy()
@@ -219,11 +262,10 @@ class ONNXNet:
 
             feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
             regression, classification = self.session.run(None, feeds)
-
-            regression = torch.from_numpy(regression).to(self.device)
-            classification = torch.from_numpy(classification).to(self.device)
-
-        return regression, classification
+            return (
+                torch.from_numpy(regression).to(device=self.device, dtype=self.dtype),
+                torch.from_numpy(classification).to(device=self.device, dtype=self.dtype),
+            )
 
 
 class BackendManager:
@@ -253,26 +295,31 @@ class BackendManager:
         self.model_fps = 0.0
         self.benchmark = benchmark
 
-        self.device = device or torch.device(
-            'cuda:0' if torch.cuda.is_available()
-            else 'mps' if torch.backends.mps.is_available()
-            else 'cpu'
-        )
-
-        # Configure hardware-aware operational dtype configurations
-        if self.device.type == "cuda":
-            major, _ = torch.cuda.get_device_capability(self.device)
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda:0")
+            major, _ = torch.cuda.get_device_capability(0)
             self.dtype = torch.bfloat16 if major >= 8 else torch.float16
-        elif self.device.type == "mps":
+            self.device_name = torch.cuda.get_device_name(0)
+
+        elif (
+            hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            self.device = torch.device("mps")
             self.dtype = torch.float16
+            self.device_name = "Apple Metal (MPS)"
+
         else:
+            import platform
+
+            self.device = torch.device("cpu")
             self.dtype = torch.float32
+            self.device_name = platform.processor() or "CPU"
 
         self.pt_net = DaSiamRPNotb()
         if os.path.exists(model_path):
             self.pt_net.load_state_dict(torch.load(model_path, map_location=self.device))
 
-        # Mount baseline architecture converted directly to target precision
         self.pt_net.eval().to(device=self.device, dtype=self.dtype)
         print(f"[INFO] Base PyTorch network mounted | device: {self.device} | dtype: {self.dtype}")
 
@@ -291,15 +338,11 @@ class BackendManager:
         return self.pt_net
 
     def export_and_build(self, r1_kernel, cls1_kernel):
-        assert r1_kernel.device == self.device
-        assert cls1_kernel.device == self.device
-
-        # Maintain exact precision parameters across runtime contexts
         r1_kernel_half = r1_kernel.to(self.dtype)
         cls1_kernel_half = cls1_kernel.to(self.dtype)
 
         if self.use_onnx and self.onnx_net is None:
-            print(f"[INFO] Exporting search.onnx using half precision context tensors...")
+            print(f"[INFO] Exporting search.onnx...")
             dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=self.dtype)
 
             with torch.inference_mode():
@@ -307,7 +350,6 @@ class BackendManager:
                 if onnx_dir:
                     os.makedirs(onnx_dir, exist_ok=True)
 
-                # Trace execution blocks matching operational low-precision graphs
                 torch.onnx.export(
                     self.pt_net,
                     (dummy_x, r1_kernel_half, cls1_kernel_half),
@@ -322,12 +364,18 @@ class BackendManager:
 
             if TRT_AVAILABLE and not os.path.exists(self.trt_path):
                 try:
-                    print("[WARN] Compiling TensorRT runtime workspace engine. This will block network threads...")
-                    TRTNet.build_trt_engine(self.onnx_path, self.trt_path, dtype = self.dtype)
+                    print("[WARN] Compiling TensorRT runtime workspace engine...")
+                    TRTNet.build_trt_engine(self.onnx_path, self.trt_path, dtype=self.dtype)
                 except Exception as e:
                     print(f"[WARN] TensorRT automatic compilation aborted: {e}")
 
-            self.onnx_net = ONNXNet(self.onnx_path, device=self.device, dtype=self.dtype)
+            self.onnx_net = ONNXNet(
+                onnx_path=self.onnx_path,
+                score_size=self.score_size,
+                anchor_num=self.anchor_num,
+                device = self.device,
+                dtype=self.dtype
+            )
 
             if self.use_trt and os.path.exists(self.trt_path):
                 try:
@@ -335,6 +383,7 @@ class BackendManager:
                         engine_path=self.trt_path,
                         score_size=self.score_size,
                         anchor_num=self.anchor_num,
+                        device=self.device,
                         dtype=self.dtype
                     )
                 except Exception as e:
@@ -345,66 +394,45 @@ class BackendManager:
             dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=self.dtype)
             self.run_benchmark(dummy_x, r1_kernel_half, cls1_kernel_half)
 
+    @torch.inference_mode()
     def run_benchmark(self, x_crop, r1_kernel, cls1_kernel, iterations=300, warmup=30):
         net, name = self.active_net
         print(f"\n[BENCHMARK] Starting isolation sweep for active backend: {name}...")
 
-        # Prepare inputs exactly as they would be natively to skip conversion overhead in loop
         x_crop = x_crop.contiguous().to(self.device, dtype=self.dtype)
         r1_kernel = r1_kernel.contiguous().to(self.device, dtype=self.dtype)
         cls1_kernel = cls1_kernel.contiguous().to(self.device, dtype=self.dtype)
 
-        # Warmup
         for _ in range(warmup):
-            _, _ = net(x_crop, r1_kernel, cls1_kernel)
+            net(x_crop, r1_kernel, cls1_kernel)
 
-        if self.device.type == "cuda":
+        if CUDA_AVAILABLE:
             torch.cuda.synchronize()
 
-            # TRT executes on its own CUDA stream; other backends use the current stream.
-            target_stream = (
-                net.stream
-                if hasattr(net, "stream")
-                else torch.cuda.current_stream(self.device)
-            )
+            target_stream = torch.cuda.current_stream(self.device)
 
-            start_events = [
-                torch.cuda.Event(enable_timing=True) for _ in range(iterations)
-            ]
-            end_events = [
-                torch.cuda.Event(enable_timing=True) for _ in range(iterations)
-            ]
+            start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
+            end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
 
             for i in range(iterations):
                 start_events[i].record(target_stream)
-                _, _ = net(x_crop, r1_kernel, cls1_kernel)
+                net(x_crop, r1_kernel, cls1_kernel)
                 end_events[i].record(target_stream)
 
             torch.cuda.synchronize()
 
-            latencies = [
-                s.elapsed_time(e)
-                for s, e in zip(start_events, end_events)
-            ]
-
+            latencies = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
         else:
-            # CPU / MPS timing
             latencies = []
 
             for _ in range(iterations):
-                if self.device.type == "mps":
-                    torch.mps.synchronize()
-
-                t0 = time.perf_counter()
-
-                _, _ = net(x_crop, r1_kernel, cls1_kernel)
-
-                if self.device.type == "mps":
-                    torch.mps.synchronize()
-
-                latencies.append((time.perf_counter() - t0) * 1000.0)
+                start = time.perf_counter()
+                net(x_crop, r1_kernel, cls1_kernel)
+                end = time.perf_counter()
+                latencies.append((end - start) * 1000.0)
 
         avg_latency = np.mean(latencies)
+        p95_latency = np.percentile(latencies, 95)
         p99_latency = np.percentile(latencies, 99)
         fps = 1000.0 / avg_latency if avg_latency > 0 else 0.0
         self.model_fps = fps
@@ -412,7 +440,9 @@ class BackendManager:
         print("\n" + "=" * 60)
         print(f" BENCHMARK RUNTIME REPORT: {name.upper()} ({self.dtype})")
         print("=" * 60)
+        print(f" * Device             : {self.device_name}")
         print(f" * Pure Inference FPS : {fps:.2f} FPS")
-        print(f" * Avg GPU Latency    : {avg_latency:.3f} ms")
-        print(f" * P99 Tail Latency   : {p99_latency:.3f} ms")
+        print(f" * Mean Latency       : {avg_latency:.3f} ms")
+        print(f" * P95 Latency        : {p95_latency:.3f} ms")
+        print(f" * P99 Latency        : {p99_latency:.3f} ms")
         print("=" * 60 + "\n")
