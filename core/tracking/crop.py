@@ -5,6 +5,7 @@ class SubwindowCropper:
     def __init__(self, model_sz, device):
         self.model_sz = model_sz
         self.device = device
+        self._base_idx_cache = {}
         idx = torch.arange(model_sz, device=device, dtype=torch.float32)
         grid_y, grid_x = torch.meshgrid(idx, idx, indexing="ij")
         self.base_idx = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
@@ -16,7 +17,7 @@ class SubwindowCropper:
             self._size_wh_cache[key] = torch.tensor([float(W), float(H)], device=device, dtype=dtype)
         return self._size_wh_cache[key]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def crop(self, im_t, pos_t, original_sz, avg_chans_t):
         """
         im_t         : (H, W, C) float32/bfloat16/float16 CUDA or CPU tensor
@@ -41,7 +42,10 @@ class SubwindowCropper:
         scale = original_sz / self.model_sz
 
         # Matches OpenCV resize convention - cast base_idx to match target precision
-        src_local = (self.base_idx.to(dtype=target_dtype) + 0.5) * scale - 0.5
+        if target_dtype not in self._base_idx_cache:
+            self._base_idx_cache[target_dtype] = self.base_idx.to(dtype=target_dtype)
+        base_idx = self._base_idx_cache[target_dtype]
+        src_local = (base_idx + 0.5) * scale - 0.5
         abs_coords = context_min[None, None, None] + src_local
 
         # grid calculation perfectly mirrors the data type of the input tensor
