@@ -1,541 +1,506 @@
-"""
-FalconEye — Gradio Frontend
-Pure HTTP/WS client. Zero ML imports.
-Flow: Capture → Segment → Init Tracker → Track / Follow
-"""
-
-import gradio as gr
-import httpx
-import websockets
-import asyncio
-import cv2
-import numpy as np
-import base64
+import sys
 import json
-import threading
 import time
-from queue import Queue, Empty
+import cv2
+import threading
+from fractions import Fraction
+import numpy as np
+import av
+
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl, QByteArray
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QHttpMultiPart, QHttpPart
+from PySide6.QtWebSockets import QWebSocket
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QRadioButton, QButtonGroup, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QGroupBox, QFileDialog, QLineEdit, QStackedWidget, QMessageBox
+)
+
+API_SEGMENT = "http://127.0.0.1:8000/segment"
+API_FOLLOW  = "http://127.0.0.1:8000/follow"
+WS_TRACK    = "ws://127.0.0.1:8000/track/live"
+
+# ----------------------------------------------------------------------
+# Real-Time H.264 Encoder Helper using PyAV
+# ----------------------------------------------------------------------
+
+class H264Encoder:
+    def __init__(self, width=640, height=480, fps=30, bitrate=1_000_000):
+        self.codec = av.CodecContext.create('h264', 'w')
+        self.codec.width = width
+        self.codec.height = height
+        self.codec.pix_fmt = 'yuv420p'
+        self.codec.time_base = Fraction(1, fps)
+        self.codec.bit_rate = bitrate
+        self.codec.gop_size = 1  # Keyframe every frame for real-time tracking
+        self.codec.options = {
+            'preset': 'ultrafast',
+            'tune': 'zerolatency',
+            'repeat-headers': '1' # Ensures decoder receives SPS/PPS in-band
+        }
+        self.codec.open()
+
+    def encode(self, cv_bgr_frame):
+
+        rgb_frame = cv2.cvtColor(cv_bgr_frame, cv2.COLOR_BGR2RGB)
+        frame = av.VideoFrame.from_ndarray(rgb_frame, format='rgb24')
+        frame = frame.reformat(format='yuv420p')
+
+        packets = self.codec.encode(frame)
+        payload = bytearray()
+        for packet in packets:
+            payload.extend(bytes(packet))
+
+        return bytes(payload)
 
 
-API_BASE = "http://localhost:8000"
-WS_BASE  = "ws://localhost:8000"
 
-state = {
-    "mask_b64":       None,
-    "last_frame_bgr": None,   # captured frame, used for segment + track init
-    "stop_flag":      False,
-    "ws_error":       None,
-    "tracking":       False,
-}
-result_queue     = Queue(maxsize=1)
-follow_queue     = Queue(maxsize=1)
-live_frame_queue = Queue(maxsize=1)   # frames streamed in from the browser webcam
-api_client    = httpx.Client(timeout=30)
-follow_client = httpx.Client(timeout=0.05)
+# ----------------------------------------------------------------------
+# Interactive Video Canvas
+# ----------------------------------------------------------------------
+class VideoCanvas(QLabel):
+    point_clicked = Signal(int, int)
 
-# ── Helpers ───────────────────────────────────────────────────
-def numpy_to_bytes(frame_bgr, quality=70):
-    _, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    return buf.tobytes()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(640, 480)
+        self.click_enabled = True
+        self.setStyleSheet("background-color: #121212; border: 1px solid #2a2a2a;")
 
-def pil_to_bgr(pil_img):
-    rgb = np.array(pil_img.convert("RGB"))
-    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        self.current_frame = None
+        self.points = []
+        self.last_bbox = None
 
-def decode_mask_b64(mask_b64):
-    mask_bytes = base64.b64decode(mask_b64)
-    return cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+    def set_frame(self, cv_img):
+        self.current_frame = cv_img.copy()
+        self.update_display()
 
-def overlay_mask(frame_bgr, mask):
-    out = frame_bgr.copy()
-    green = out.copy()
-    green[mask > 127] = [0, 200, 0]
-    return cv2.addWeighted(green, 0.45, out, 0.55, 0)
+    def set_bbox(self, bbox):
+        self.last_bbox = bbox
+        self.update_display()
 
-def draw_bbox(
-    frame_bgr,
-    bbox,
-    backend=None,
-    model_fps=None,
-    tracker_fps=None,
-    score=None,
-    lost=False,
-):
-    x, y, w, h = [int(v) for v in bbox]
+    def clear_overlays(self):
+        self.points.clear()
+        self.last_bbox = None
+        self.update_display()
 
-    out = frame_bgr.copy()
+    def mousePressEvent(self, event):
+        if not self.click_enabled:
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self.current_frame is not None:
+            pixmap = self.pixmap()
+            if not pixmap or pixmap.isNull():
+                return
 
-    color = (0, 80, 255) if lost else (0, 220, 0)
-    cv2.rectangle(out, (x, y), (x + w, y + h), color, 2)
+            p_w, p_h = pixmap.width(), pixmap.height()
+            l_w, l_h = self.width(), self.height()
+            x_offset, y_offset = (l_w - p_w) / 2, (l_h - p_h) / 2
 
-    if score is not None:
-        label = f"{'LOST' if lost else 'OK'}  {score:.2f}"
-        cv2.putText(
-            out,
-            label,
-            (x, max(y - 10, 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
+            click_x = event.position().x() - x_offset
+            click_y = event.position().y() - y_offset
+
+            if 0 <= click_x <= p_w and 0 <= click_y <= p_h:
+                frame_h, frame_w = self.current_frame.shape[:2]
+                img_x = int((click_x / p_w) * frame_w)
+                img_y = int((click_y / p_h) * frame_h)
+                self.points.append((img_x, img_y))
+                self.point_clicked.emit(img_x, img_y)
+                self.update_display()
+
+    def update_display(self):
+        if self.current_frame is None:
+            return
+
+        display_img = self.current_frame.copy()
+        orig_h, orig_w = display_img.shape[:2]
+
+        # Draw Target Bounding Box
+        if self.last_bbox and len(self.last_bbox) == 4:
+            x, y, w, h = self.last_bbox
+            x1, y1 = int(x), int(y)
+            x2, y2 = int(x + w), int(y + h)
+
+            cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+        # Draw Red Click Dots
+        for pt in self.points:
+            cv2.circle(display_img, pt, 4, (0, 0, 255), -1)
+
+        # Render Scaled Pixmap to QLabel
+        rgb_img = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        q_img = QImage(rgb_img.data, orig_w, orig_h, orig_w * 3, QImage.Format.Format_RGB888)
+        scaled_pixmap = QPixmap.fromImage(q_img).scaled(
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
         )
-
-    hud = []
-
-    if backend is not None:
-        hud.append(str(backend))
-
-    if tracker_fps is not None:
-        hud.append(f"Tracker: {tracker_fps:.1f} FPS")
-
-    if model_fps is not None:
-        hud.append(f"Model: {model_fps:.1f} FPS")
-
-    if hud:
-        cv2.putText(
-            out,
-            " | ".join(hud),
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
-            2,
-        )
-
-    return out
+        self.setPixmap(scaled_pixmap)
 
 
-def prep_frame(rgb_np):
-    """Normalize a browser-supplied RGB numpy frame into the working BGR format.
-    This is the only place frame pre-processing happens now, since both the
-    one-shot capture and the streaming loop funnel through here."""
-    bgr = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2BGR)
-    return bgr
+# ----------------------------------------------------------------------
+# Camera Thread with Horizontal Mirroring
+# ----------------------------------------------------------------------
 
+class CameraWorker(QThread):
+    frame_received = Signal(np.ndarray, float)
 
-def follow_worker():
-    while True:
-        bbox = follow_queue.get()
+    def __init__(self, camera_id=0):
+        super().__init__()
+        self.camera_id = camera_id
+        self.running = True
 
-        try:
-            follow_client.post(
-                f"{API_BASE}/follow/command",
-                json={"bbox": bbox},
-            )
-        except Exception as e:
-            print(e)
+    def stop(self):
+        self.running = False
+        self.wait()
 
-# ── Step 1: Capture (browser webcam — no server-side VideoCapture) ──
-def capture_frame(np_img):
-    """np_img is whatever the browser's webcam widget currently holds
-    (an RGB numpy array). We never open a camera device on the server."""
-    if np_img is None:
-        return None, "No webcam frame yet — allow camera access in your browser and try again."
-    frame_bgr = prep_frame(np_img)
-    state["last_frame_bgr"] = frame_bgr
-    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), "Frame captured. Now segment."
+    def run(self):
+        cap = cv2.VideoCapture(self.camera_id)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# ── Click collector ───────────────────────────────────────────
-
-def on_image_click(np_img, method, click_points_state, evt: gr.SelectData):
-    if method != "click":
-        return np_img, json.dumps(click_points_state), click_points_state
-
-    x, y = evt.index
-    click_points_state = click_points_state + [[x, y]]
-
-    clean = state["last_frame_bgr"]
-    clean_rgb = cv2.cvtColor(clean, cv2.COLOR_BGR2RGB)
-    vis = clean_rgb.copy()
-    for px, py in click_points_state:
-        cv2.circle(vis, (px, py), 7, (255, 60, 60), -1)
-    return vis, json.dumps(click_points_state), click_points_state
-
-def clear_clicks(np_img):
-    # Grab the clean frame without circles, if it exists
-    if state["last_frame_bgr"] is not None:
-        clean_rgb = cv2.cvtColor(state["last_frame_bgr"], cv2.COLOR_BGR2RGB)
-        return clean_rgb, "[]", []
-
-    return np_img, "[]", []
-
-# ── Step 2: Segment ───────────────────────────────────────────
-def run_segment(np_img, method, click_pts_json, text_prompt, ref_pil):
-    if np_img is None:
-        return None, None, "Capture a frame first.", gr.update(visible=False)
-    frame_bgr = state["last_frame_bgr"]
-
-    files = {"file": ("frame.jpg", numpy_to_bytes(frame_bgr), "image/jpeg")}
-    data  = {"method": method}
-
-    if method == "click":
-        pts = json.loads(click_pts_json or "[]")
-        if not pts:
-            return None, None, "No click points recorded.", gr.update(visible=False)
-        data["points"] = json.dumps(pts)
-    elif method == "text":
-        if not text_prompt.strip():
-            return None, None, "Enter a text prompt.", gr.update(visible=False)
-        data["text"] = text_prompt.strip()
-    elif method == "reference":
-        if ref_pil is None:
-            return None, None, "Upload a reference image.", gr.update(visible=False)
-        files["ref_file"] = ("ref.jpg", numpy_to_bytes(pil_to_bgr(ref_pil)), "image/jpeg")
-
-    try:
-        resp =  api_client.post(
-            f"{API_BASE}/segment",
-            files=files,
-            data=data,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        return None, None, f"Segment failed: {e}", gr.update(visible=False)
-
-    result   = resp.json()
-    mask_b64 = result["mask_b64"]
-    bbox     = result.get("bbox")
-    state["mask_b64"] = mask_b64
-
-    mask = decode_mask_b64(mask_b64)
-    vis  = overlay_mask(frame_bgr, mask)
-    if bbox:
-        vis = draw_bbox(vis, bbox)
-
-    return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), f"Done. bbox={bbox}", gr.update(visible=True)
-# ── Step 3: Init tracker ──────────────────────────────────────
-def init_tracker():
-    if state["last_frame_bgr"] is None or state["mask_b64"] is None:
-        return "Run segmentation first.", gr.update(visible=False), gr.update(visible=False)
-    files = {"file": ("frame.jpg", numpy_to_bytes(state["last_frame_bgr"]), "image/jpeg")}
-    data  = {"mask_b64": state["mask_b64"]}
-    try:
-        resp = api_client.post(
-            f"{API_BASE}/track/init",
-            files=files,
-            data=data,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        return f"Track init failed: {e}", gr.update(visible=False), gr.update(visible=False)
-    bbox = resp.json()["bbox"]
-    # live_group AND the streaming webcam both become visible so the browser
-    # starts pushing frames once tracking is actually possible.
-    return f"Tracker ready. bbox={bbox}", gr.update(visible=True), gr.update(visible=True)
-
-# ── Step 4: Track / Follow ────────────────────────────────────
-def stop_all():
-    state["stop_flag"] = True
-    state["tracking"]  = False
-    return "Stopped.", None, ""
-
-def push_live_frame(rgb_np):
-    """Wired to the streaming webcam component's .stream() event. The browser
-    calls this repeatedly with fresh frames; we just drop them in a queue for
-    the background WS thread to consume. Still zero server-side camera access."""
-    if rgb_np is None:
-        return
-    frame_bgr = prep_frame(rgb_np)
-    if live_frame_queue.full():
-        try:
-            live_frame_queue.get_nowait()
-        except Empty:
-            pass
-    live_frame_queue.put(frame_bgr)
-
-_ws_thread_lock = threading.Lock()
-_ws_thread_handle = None
-def _ws_thread(mode):
-    global _ws_thread_handle
-
-    async def run():
-        reconnect_delay = 1.0
-        while not state["stop_flag"]:
-            try:
-                print(f"[INFO] Connecting to tracking WebSocket at {WS_BASE}/track/live...")
-                async with websockets.connect(f"{WS_BASE}/track/live") as ws:
-                    state["ws_error"] = None
-                    while not state["stop_flag"]:
-                        try:
-                            frame = live_frame_queue.get(timeout=0.1)
-                        except Empty:
-                            continue
-
-                        jpg = numpy_to_bytes(frame)
-
-                        try:
-                            await ws.send(jpg)
-                            raw = await ws.recv()
-                        except websockets.ConnectionClosed as cc:
-                            if cc.code == 1012:
-                                print("[WARN] WebSocket encountered 1012 (Service Restart). Reconnecting...")
-                            else:
-                                print(f"[WARN] WebSocket connection broken (Code: {cc.code}). Retrying...")
-                            raise
-
-                        result = json.loads(raw)
-                        if "error" in result:
-                            state["ws_error"] = result["error"]
-                            break
-
-                        if result_queue.full():
-                            result_queue.get_nowait()
-                        result_queue.put((frame, result))
-                        state["ws_error"] = None
-
-                        if mode == "follow" and not result.get("lost"):
-                            try:
-                                if follow_queue.full():
-                                    follow_queue.get_nowait()
-                                follow_queue.put(result["bbox"])
-                            except Exception as e:
-                                print(f"[ERR] Follow queue update failure: {e}")
-
-            except (websockets.ConnectionClosed, OSError, Exception) as e:
-                state["ws_error"] = f"Connection split: {str(e)}. Re-establishing loop context..."
-                print(f"[WARN] Streaming heartbeat interrupted: {e}")
-                await asyncio.sleep(reconnect_delay)
+        while self.running and cap.isOpened():
+            t0 = time.time()
+            ret, frame = cap.read()
+            if not ret:
+                self.msleep(1)
                 continue
 
-    with _ws_thread_lock:
-        if _ws_thread_handle is not None and _ws_thread_handle.is_alive():
-            state["stop_flag"] = True
-            _ws_thread_handle.join(timeout=2)
-        state["stop_flag"] = False
-        _ws_thread_handle = threading.Thread(target=lambda: asyncio.run(run()), daemon=True)
-        _ws_thread_handle.start()
+            frame = cv2.flip(frame, 1)
+            latency = (time.time() - t0) * 1000
+            self.frame_received.emit(frame, latency)
+            self.msleep(1)
 
-def _start_and_poll(mode):
-    state["stop_flag"]  = False
-    state["tracking"]   = True
-    _ws_thread(mode)
+        cap.release()
 
-    while state["tracking"] or not result_queue.empty():
-        if state["ws_error"]:
-            yield None, f"Error: {state['ws_error']}", ""
-            state["ws_error"] = None
-            break
-        if not result_queue.empty():
-            frame_bgr, result = result_queue.get()
+# ----------------------------------------------------------------------
+# Main Application Dashboard
+# ----------------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Vision Dashboard")
+        self.resize(1100, 650)
 
-            bbox = result["bbox"]
-            model_fps = result["model_fps"]
-            tracker_fps = result["tracker_fps"]
-            backend = result["backend"]
-            score = result["score"]
-            lost = result["lost"]
+        # State Variables
+        self.latest_raw_frame = None
+        self.ref_image_bytes = None
+        self.is_frozen = False
+        self.is_tracking = False
+        self.encoder = None
 
-            vis = draw_bbox(
-                frame_bgr,
-                bbox,
-                backend,
-                model_fps,
-                tracker_fps,
-                score,
-                lost,
-            )
+        # Metrics Dict Storage
+        self.dynamic_metrics = {}
 
-            status = (
-                "follow mode active" if not lost else "LOST"
-            ) if mode == "follow" else (
-                f"{'LOST' if lost else 'tracking'}  score={score:.2f}"
-            )
+        # Qt Async HTTP & WebSockets
+        self.network_manager = QNetworkAccessManager(self)
+        self.network_manager.finished.connect(self.on_http_response)
 
-            fps_str = (
-                f'<p class="fps-display">'
-                f'Model: {model_fps:.1f} FPS | '
-                f'Tracker: {tracker_fps:.1f} FPS'
-                f'</p>'
-            )
+        self.ws_client = QWebSocket()
+        self.ws_client.connected.connect(self.on_ws_connected)
+        self.ws_client.disconnected.connect(self.on_ws_disconnected)
+        self.ws_client.textMessageReceived.connect(self.on_ws_message_received)
 
-            yield cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), status, fps_str
+        self.init_ui()
+
+        # Start Camera
+        self.camera_thread = CameraWorker()
+        self.camera_thread.frame_received.connect(self.on_frame_received)
+        self.camera_thread.start()
+
+    def init_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_h_layout = QHBoxLayout(central_widget)
+
+        # LEFT SIDE: Video Canvas & Controls
+        left_v_layout = QVBoxLayout()
+
+        self.video_canvas = VideoCanvas()
+        self.video_canvas.point_clicked.connect(self.on_canvas_point_clicked)
+        left_v_layout.addWidget(self.video_canvas, stretch=4)
+
+        controls_group = QGroupBox("Control Panel")
+        controls_v_layout = QVBoxLayout(controls_group)
+
+        self.btn_capture = QPushButton("Capture Frame")
+        self.btn_capture.setStyleSheet("font-weight: bold; background-color: #2196F3; color: white; padding: 8px;")
+        self.btn_capture.clicked.connect(self.capture_frame)
+        controls_v_layout.addWidget(self.btn_capture)
+
+        segment_box = QGroupBox("Segment Options")
+        segment_v_layout = QVBoxLayout(segment_box)
+
+        radio_layout = QHBoxLayout()
+        self.radio_group = QButtonGroup(self)
+        self.radio_click = QRadioButton("Click")
+        self.radio_ref = QRadioButton("Reference")
+        self.radio_text = QRadioButton("Text")
+        self.radio_click.setChecked(True)
+
+        self.radio_group.addButton(self.radio_click, 0)
+        self.radio_group.addButton(self.radio_ref, 1)
+        self.radio_group.addButton(self.radio_text, 2)
+
+        radio_layout.addWidget(self.radio_click)
+        radio_layout.addWidget(self.radio_ref)
+        radio_layout.addWidget(self.radio_text)
+        radio_layout.addStretch()
+
+        segment_v_layout.addLayout(radio_layout)
+
+        self.input_stack = QStackedWidget()
+        self.input_stack.addWidget(QLabel("Click on the video stream above to select target points."))
+
+        page_ref = QWidget()
+        p_ref_l = QHBoxLayout(page_ref)
+        p_ref_l.setContentsMargins(0, 0, 0, 0)
+        self.btn_upload_ref = QPushButton("Upload Reference Image...")
+        self.lbl_ref_path = QLabel("No file selected.")
+        self.btn_upload_ref.clicked.connect(self.select_reference_image)
+        p_ref_l.addWidget(self.btn_upload_ref)
+        p_ref_l.addWidget(self.lbl_ref_path)
+        p_ref_l.addStretch()
+        self.input_stack.addWidget(page_ref)
+
+        page_text = QWidget()
+        p_txt_l = QHBoxLayout(page_text)
+        p_txt_l.setContentsMargins(0, 0, 0, 0)
+        self.txt_prompt = QLineEdit()
+        self.txt_prompt.setPlaceholderText("Enter target text prompt...")
+        p_txt_l.addWidget(self.txt_prompt)
+        self.input_stack.addWidget(page_text)
+
+        segment_v_layout.addWidget(self.input_stack)
+
+        self.btn_run_segment = QPushButton("Segment Target")
+        self.btn_run_segment.clicked.connect(self.trigger_segmentation)
+        segment_v_layout.addWidget(self.btn_run_segment)
+
+        controls_v_layout.addWidget(segment_box)
+
+        act_layout = QHBoxLayout()
+        self.btn_track = QPushButton("Track")
+        self.btn_follow = QPushButton("Follow")
+        self.btn_clear = QPushButton("Clear")
+
+        self.btn_track.clicked.connect(self.toggle_tracking)
+        self.btn_follow.clicked.connect(self.trigger_follow)
+        self.btn_clear.clicked.connect(self.clear_all)
+
+        act_layout.addWidget(self.btn_track)
+        act_layout.addWidget(self.btn_follow)
+        act_layout.addWidget(self.btn_clear)
+
+        controls_v_layout.addLayout(act_layout)
+        left_v_layout.addWidget(controls_group, stretch=1)
+
+        main_h_layout.addLayout(left_v_layout, stretch=3)
+
+        # RIGHT SIDE: Dynamic Metrics Panel
+        right_metrics_box = QGroupBox("Backend Metrics")
+        right_metrics_box.setMinimumWidth(300)
+
+        self.metrics_container = QVBoxLayout(right_metrics_box)
+        self.metrics_grid = QGridLayout()
+        self.metrics_grid.setSpacing(10)
+
+        self.metrics_container.addLayout(self.metrics_grid)
+        self.metrics_container.addStretch()
+
+        main_h_layout.addWidget(right_metrics_box, stretch=1)
+
+        self.radio_group.idClicked.connect(self.on_mode_changed)
+        self.update_metrics_display({"Status": "Idle"})
+
+    def update_metrics_display(self, metrics_dict):
+        while self.metrics_grid.count():
+            item = self.metrics_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        row = 0
+        for key, val in metrics_dict.items():
+            k_lbl = QLabel(f"<b>{key}:</b>")
+            v_lbl = QLabel(str(val))
+            v_lbl.setWordWrap(True)
+
+            self.metrics_grid.addWidget(k_lbl, row, 0)
+            self.metrics_grid.addWidget(v_lbl, row, 1)
+            row += 1
+
+    @Slot(np.ndarray, float)
+    def on_frame_received(self, frame, latency):
+        self.latest_raw_frame = frame
+        if not self.is_frozen:
+            self.video_canvas.set_frame(frame)
+
+        # Encode and send continuous raw H.264 NAL bytes
+        if self.is_tracking and self.ws_client.isValid() and self.encoder:
+            h264_bytes = self.encoder.encode(frame)
+            if h264_bytes:
+                self.ws_client.sendBinaryMessage(QByteArray(h264_bytes))
+
+    def capture_frame(self):
+        self.is_frozen = True
+        self.video_canvas.points.clear()
+        self.video_canvas.last_bbox = None
+        self.video_canvas.update_display()
+        self.update_metrics_display({"Status": "Frame Captured"})
+
+    def trigger_segmentation(self):
+        if self.latest_raw_frame is None:
+            return
+
+        method_id = self.radio_group.checkedId()
+        method_map = {0: "click", 1: "reference", 2: "text"}
+        method = method_map[method_id]
+
+        multi_part = QHttpMultiPart(QHttpMultiPart.ContentType.FormDataType)
+
+        method_part = QHttpPart()
+        method_part.setHeader(QNetworkRequest.KnownHeaders.ContentDispositionHeader, 'form-data; name="method"')
+        method_part.setBody(method.encode('utf-8'))
+        multi_part.append(method_part)
+
+        # Single image payload remains JPEG over HTTP
+        _, buffer = cv2.imencode('.jpg', self.latest_raw_frame)
+        file_part = QHttpPart()
+        file_part.setHeader(QNetworkRequest.KnownHeaders.ContentDispositionHeader, 'form-data; name="file"; filename="frame.jpg"')
+        file_part.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "image/jpeg")
+        file_part.setBody(buffer.tobytes())
+        multi_part.append(file_part)
+
+        if method == "click":
+            p_part = QHttpPart()
+            p_part.setHeader(QNetworkRequest.KnownHeaders.ContentDispositionHeader, 'form-data; name="points"')
+            p_part.setBody(json.dumps(self.video_canvas.points).encode('utf-8'))
+            multi_part.append(p_part)
+
+        elif method == "reference" and self.ref_image_bytes:
+            ref_part = QHttpPart()
+            ref_part.setHeader(QNetworkRequest.KnownHeaders.ContentDispositionHeader, 'form-data; name="ref_file"; filename="ref.jpg"')
+            ref_part.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "image/jpeg")
+            ref_part.setBody(self.ref_image_bytes)
+            multi_part.append(ref_part)
+
+        elif method == "text":
+            t_part = QHttpPart()
+            t_part.setHeader(QNetworkRequest.KnownHeaders.ContentDispositionHeader, 'form-data; name="text"')
+            t_part.setBody(self.txt_prompt.text().strip().encode('utf-8'))
+            multi_part.append(t_part)
+
+        request = QNetworkRequest(QUrl(API_SEGMENT))
+        reply = self.network_manager.post(request, multi_part)
+        reply.setProperty("req_type", "segment")
+        multi_part.setParent(reply)
+
+    def on_mode_changed(self, idx):
+        self.input_stack.setCurrentIndex(idx)
+        self.video_canvas.click_enabled = (idx == 0)
+
+        if idx != 0:
+            self.video_canvas.points.clear()
+            self.video_canvas.update_display()
+
+    def toggle_tracking(self):
+        if not self.is_tracking:
+            self.ws_client.open(QUrl(WS_TRACK))
         else:
-            time.sleep(0.005)  # only sleep when idle, not every iteration
+            self.close_websocket()
 
-def do_track():
-    yield from _start_and_poll("track")
+    @Slot()
+    def on_ws_connected(self):
+        bbox = self.video_canvas.last_bbox
+        if bbox is None or self.latest_raw_frame is None:
+            return
 
-def do_follow():
-    yield from _start_and_poll("follow")
+        self.video_canvas.points.clear()
+        self.video_canvas.update_display()
 
-# ── UI ────────────────────────────────────────────────────────
-css = """
-.step-label {
-    font-size: 11px; font-weight: 500; letter-spacing: 0.06em;
-    text-transform: uppercase; color: var(--color-text-secondary);
-    margin: 0 0 6px 0;
-}
-.status-txt { font-size: 13px; color: var(--color-text-secondary); min-height: 18px; }
-.fps-display { font-size: 32px; font-weight: 600; text-align: center; padding: 6px 0; }
-"""
+        h, w = self.latest_raw_frame.shape[:2]
+        self.encoder = H264Encoder(width=w, height=h, fps=30)
 
-with gr.Blocks(title="FalconEye: A Modular Prompt-Guided Perception and Tracking System") as demo:
+        # Step 1: BBox Metadata
+        self.ws_client.sendTextMessage(json.dumps({"bbox": bbox}))
 
-    gr.Markdown("## 🚀 FalconEye: A Modular Prompt-Guided Perception and Tracking System\nSegment · Track · Follow")
+        # Step 2: First keyframe
+        h264_bytes = self.encoder.encode(self.latest_raw_frame)
+        if h264_bytes:
+            self.ws_client.sendBinaryMessage(QByteArray(h264_bytes))
 
-    with gr.Row(equal_height=False):
+        # NOTE: Do NOT set self.is_tracking = True here yet! Wait for backend confirmation.
 
-        # ── LEFT ──────────────────────────────────────────────
-        with gr.Column(scale=5):
+    @Slot(str)
+    def on_ws_message_received(self, message):
+        try:
+            data = json.loads(message)
+            if data.get("status") == "initialized":
+                # Server is ready; begin frame streaming now
+                self.is_tracking = True
+                self.is_frozen = False
+                self.btn_track.setText("Stop Track")
+                return
 
-            gr.HTML('<p class="step-label">Capture frame</p>')
-            gr.HTML(
-                '<p class="status-txt">Allow camera access below, then press the '
-                'shutter/camera icon INSIDE the widget to snap a photo.</p>'
-            )
-            # Webcam widget: only job is snapping a photo. Its .select() click
-            # events are unreliable in Gradio while it's in webcam-source mode,
-            # so we never try to mark click-points directly on this one.
-            webcam_widget = gr.Image(
-                label="Webcam",
-                type="numpy",
-                sources=["webcam"],
-                streaming=False,
-                interactive=True,
-            )
-            # Plain display/annotation image — populated from webcam_widget after
-            # a snapshot. Not a webcam source itself, so .select() click events
-            # fire reliably for click-based segmentation.
-            input_frame = gr.Image(
-                label="Captured frame (click here to mark segmentation points)",
-                type="numpy",
-                interactive=False,
-                sources=[],
-            )
-            capture_status = gr.HTML('<p class="status-txt"></p>')
+            if "bbox" in data:
+                self.video_canvas.set_bbox(data["bbox"])
+            self.update_metrics_display(data)
+        except json.JSONDecodeError:
+            pass
 
-            gr.HTML('<p class="step-label" style="margin-top:14px;">2 — segmentation method</p>')
-            method = gr.Radio(
-                ["click", "text", "reference"],
-                value="text", label="", container=False,
-            )
-            text_prompt = gr.Textbox(
-                label="Text prompt",
-                placeholder="e.g. red car, person in blue jacket",
-                visible=True,
-            )
-            ref_image = gr.Image(
-                label="Reference image", type="pil",
-                sources=["upload"], visible=False, height=150,
-            )
-            with gr.Row(visible=False) as click_row:
-                click_pts = gr.Textbox(value="[]", visible=False)
-                clear_btn = gr.Button("Clear clicks", size="sm")
-            click_hint = gr.HTML(
-                '<p class="status-txt">Click on the frame above to mark the object.</p>',
-                visible=False,
-            )
+    @Slot()
+    def on_ws_disconnected(self):
+        self.close_websocket()
 
-            seg_btn    = gr.Button("Segment", variant="primary", size="lg")
-            seg_status = gr.HTML('<p class="status-txt"></p>')
+    def close_websocket(self):
+        if self.ws_client.isValid():
+            self.ws_client.close()
+        self.is_tracking = False
+        self.encoder = None
+        self.btn_track.setText("Track")
 
-        # ── RIGHT ─────────────────────────────────────────────
-        with gr.Column(scale=5):
+    def trigger_follow(self):
+        request = QNetworkRequest(QUrl(API_FOLLOW))
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/json")
+        payload = json.dumps({"action": "follow"}).encode('utf-8')
+        reply = self.network_manager.post(request, payload)
+        reply.setProperty("req_type", "follow")
 
-            gr.HTML('<p class="step-label">Output</p>')
-            output_frame = gr.Image(
-                label="", type="pil",
-                height=320, interactive=False,
-            )
+    @Slot(QNetworkReply)
+    def on_http_response(self, reply: QNetworkReply):
+        if reply.error() == QNetworkReply.NetworkError.NoError:
+            try:
+                data = json.loads(reply.readAll().data().decode('utf-8'))
+                if "bbox" in data:
+                    self.video_canvas.set_bbox(data["bbox"])
+                self.update_metrics_display(data)
+            except json.JSONDecodeError:
+                pass
+        reply.deleteLater()
 
-            fps_display = gr.HTML('<p class="fps-display"></p>')
-            track_status = gr.HTML('<p class="status-txt"></p>')
+    def on_canvas_point_clicked(self, x, y):
+        pass
 
-            with gr.Column(visible=False) as action_group:
-                gr.HTML('<p class="step-label" style="margin-top:10px;">3 — tracking</p>')
-                track_init_btn    = gr.Button("Initialize tracker", variant="secondary")
-                track_init_status = gr.HTML('<p class="status-txt"></p>')
+    def select_reference_image(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Ref Image", "", "Images (*.png *.jpg *.jpeg)")
+        if path:
+            self.lbl_ref_path.setText(path)
+            with open(path, 'rb') as f:
+                self.ref_image_bytes = f.read()
 
-                with gr.Column(visible=False) as live_group:
-                    # This is the ONLY thing that keeps the browser camera alive
-                    # during Track/Follow. It streams frames straight into
-                    # push_live_frame() via .stream() below
-                    gr.HTML(
-                        '<p class="status-txt">Press the button below to start live feed, then click Track or Follow. </p>'
-                    )
-                    live_webcam = gr.Image(
-                        label="Live Camera",
-                        sources=["webcam"],
-                        streaming=True,
-                        type="numpy",
-                        height=160,
-                    )
-                    with gr.Row():
-                        track_btn  = gr.Button("Track",  variant="primary")
-                        follow_btn = gr.Button("Follow", variant="primary")
-                        stop_btn   = gr.Button("Stop",   variant="stop")
+    def clear_all(self):
+        self.close_websocket()
+        self.is_frozen = False
+        self.video_canvas.clear_overlays()
+        self.update_metrics_display({"Status": "Idle"})
 
+    def closeEvent(self, event):
+        self.close_websocket()
+        self.camera_thread.stop()
+        event.accept()
 
-
-    # ── Wiring ────────────────────────────────────────────────
-
-    # capture — fires the moment the webcam widget actually holds a snapshot
-    # (i.e. right after the user presses its internal shutter icon), rather
-    # than waiting for a separate button that could read a stale/empty value.
-    webcam_widget.change(
-        capture_frame,
-        inputs=[webcam_widget],
-        outputs=[input_frame, capture_status],
-    )
-
-    # method show/hide
-    def update_method(m):
-        return (
-            gr.update(visible=(m == "text")),
-            gr.update(visible=(m == "reference")),
-            gr.update(visible=(m == "click")),
-            gr.update(visible=(m == "click")),
-        )
-    method.change(update_method, method,
-                  [text_prompt, ref_image, click_row, click_hint])
-    click_points_state = gr.State([])
-    # clicks on captured frame
-    input_frame.select(
-        on_image_click, [input_frame, method, click_points_state],
-        [input_frame, click_pts, click_points_state],
-    )
-    clear_btn.click(clear_clicks, [input_frame], [input_frame, click_pts, click_points_state])
-
-    # segment
-    seg_btn.click(
-        run_segment,
-        [input_frame, method, click_pts, text_prompt, ref_image],
-        [output_frame, seg_status, action_group],
-    )
-
-    # init tracker — also reveals the streaming webcam so the browser starts
-    # pushing live frames only once there's a tracker to feed them to
-    track_init_btn.click(
-        init_tracker, [],
-        [track_init_status, live_group, live_webcam],
-    )
-
-    # live webcam stream -> queue consumed by the background WS thread
-    live_webcam.stream(
-        push_live_frame,
-        inputs=[live_webcam],
-        outputs=[],
-    )
-
-    # track + follow — streaming=True is critical
-    track_btn.click(
-        do_track, [],
-        [output_frame, track_status, fps_display],
-    )
-    follow_btn.click(
-        do_follow, [],
-        [output_frame, track_status, fps_display],
-    )
-
-    # stop
-    stop_btn.click(
-        stop_all, [],
-        [track_status, output_frame, fps_display],
-    )
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=follow_worker,
-        daemon=True,
-    ).start()
-    demo.launch(css=css, theme=gr.themes.Soft(), server_name = "0.0.0.0", server_port=7860, share=True)
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
