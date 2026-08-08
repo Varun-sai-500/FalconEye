@@ -2,7 +2,6 @@ import sys
 import json
 import time
 import cv2
-import threading
 from fractions import Fraction
 import numpy as np
 import av
@@ -21,10 +20,10 @@ API_SEGMENT = "http://127.0.0.1:8000/segment"
 API_FOLLOW  = "http://127.0.0.1:8000/follow"
 WS_TRACK    = "ws://127.0.0.1:8000/track/live"
 
+
 # ----------------------------------------------------------------------
 # Real-Time H.264 Encoder Helper using PyAV
 # ----------------------------------------------------------------------
-
 class H264Encoder:
     def __init__(self, width=640, height=480, fps=30, bitrate=1_000_000):
         self.codec = av.CodecContext.create('h264', 'w')
@@ -37,12 +36,13 @@ class H264Encoder:
         self.codec.options = {
             'preset': 'ultrafast',
             'tune': 'zerolatency',
-            'repeat-headers': '1' # Ensures decoder receives SPS/PPS in-band
+            'repeat-headers': '1'
         }
         self.codec.open()
 
     def encode(self, cv_bgr_frame):
-
+        if self.codec is None:
+            return b""
         rgb_frame = cv2.cvtColor(cv_bgr_frame, cv2.COLOR_BGR2RGB)
         frame = av.VideoFrame.from_ndarray(rgb_frame, format='rgb24')
         frame = frame.reformat(format='yuv420p')
@@ -54,6 +54,20 @@ class H264Encoder:
 
         return bytes(payload)
 
+    def close(self):
+        """Flush remaining packets and close the encoder context safely."""
+        if self.codec is not None:
+            try:
+                # Passing None to encode() flushes the encoder buffer
+                packets = self.codec.encode(None)
+                payload = bytearray()
+                for packet in packets:
+                    payload.extend(bytes(packet))
+                self.codec = None
+                return bytes(payload)
+            except Exception:
+                self.codec = None
+        return b""
 
 
 # ----------------------------------------------------------------------
@@ -68,6 +82,9 @@ class VideoCanvas(QLabel):
         self.setMinimumSize(640, 480)
         self.click_enabled = True
         self.setStyleSheet("background-color: #121212; border: 1px solid #2a2a2a;")
+
+        # Enable native Qt image scaling to avoid doing CPU-heavy scaling per frame
+        self.setScaledContents(True)
 
         self.current_frame = None
         self.points = []
@@ -121,26 +138,21 @@ class VideoCanvas(QLabel):
             x, y, w, h = self.last_bbox
             x1, y1 = int(x), int(y)
             x2, y2 = int(x + w), int(y + h)
-
             cv2.rectangle(display_img, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
         # Draw Red Click Dots
         for pt in self.points:
             cv2.circle(display_img, pt, 4, (0, 0, 255), -1)
 
-        # Render Scaled Pixmap to QLabel
+        # Direct pixmap assignment without per-frame software resampling
         rgb_img = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
         q_img = QImage(rgb_img.data, orig_w, orig_h, orig_w * 3, QImage.Format.Format_RGB888)
-        scaled_pixmap = QPixmap.fromImage(q_img).scaled(
-            self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-        )
-        self.setPixmap(scaled_pixmap)
+        self.setPixmap(QPixmap.fromImage(q_img))
 
 
 # ----------------------------------------------------------------------
 # Camera Thread with Horizontal Mirroring
 # ----------------------------------------------------------------------
-
 class CameraWorker(QThread):
     frame_received = Signal(np.ndarray, float)
 
@@ -156,20 +168,25 @@ class CameraWorker(QThread):
     def run(self):
         cap = cv2.VideoCapture(self.camera_id)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        failed_reads = 0
 
         while self.running and cap.isOpened():
             t0 = time.time()
             ret, frame = cap.read()
             if not ret:
-                self.msleep(1)
+                failed_reads += 1
+                if failed_reads > 50:
+                    break
+                self.msleep(10)
                 continue
-
+            failed_reads = 0
             frame = cv2.flip(frame, 1)
             latency = (time.time() - t0) * 1000
             self.frame_received.emit(frame, latency)
             self.msleep(1)
 
         cap.release()
+
 
 # ----------------------------------------------------------------------
 # Main Application Dashboard
@@ -336,9 +353,11 @@ class MainWindow(QMainWindow):
 
         # Encode and send continuous raw H.264 NAL bytes
         if self.is_tracking and self.ws_client.isValid() and self.encoder:
-            h264_bytes = self.encoder.encode(frame)
-            if h264_bytes:
-                self.ws_client.sendBinaryMessage(QByteArray(h264_bytes))
+            # Backpressure guard: drop frames if outgoing network buffer is accumulating
+            if self.ws_client.bytesToWrite() < 200_000:
+                h264_bytes = self.encoder.encode(frame)
+                if h264_bytes:
+                    self.ws_client.sendBinaryMessage(QByteArray(h264_bytes))
 
     def capture_frame(self):
         self.is_frozen = True
@@ -455,7 +474,12 @@ class MainWindow(QMainWindow):
         if self.ws_client.isValid():
             self.ws_client.close()
         self.is_tracking = False
-        self.encoder = None
+
+        # Flush and clear encoder context safely
+        if self.encoder:
+            self.encoder.close()
+            self.encoder = None
+
         self.btn_track.setText("Track")
 
     def trigger_follow(self):
@@ -467,7 +491,10 @@ class MainWindow(QMainWindow):
 
     @Slot(QNetworkReply)
     def on_http_response(self, reply: QNetworkReply):
-        if reply.error() == QNetworkReply.NetworkError.NoError:
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            err_msg = reply.errorString()
+            self.update_metrics_display({"Status": "Error", "Details": err_msg})
+        else:
             try:
                 data = json.loads(reply.readAll().data().decode('utf-8'))
                 if "bbox" in data:
