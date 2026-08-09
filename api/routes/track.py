@@ -1,8 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException, status
-import numpy as np
-import cv2
 import json
 import tempfile
 import shutil
@@ -11,32 +9,43 @@ import av
 from services.tracking_service import create_tracker
 
 router = APIRouter()
-executor = ThreadPoolExecutor(max_workers=1)
 
+# Isolated thread pools
+io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="file_io")
+decoder_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h264_decode")  # Serialized for thread-safety
+tracker_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trt_tracker")  # Serialized CUDA/TRT context
 
-def decode_h264_packet(codec_context: av.CodecContext, packet_bytes: bytes) -> np.ndarray | None:
+def create_low_latency_codec_context() -> av.CodecContext:
+    ctx = av.CodecContext.create("h264", "r")
+    ctx.thread_type = "NONE"
+    ctx.flags |= av.codec.context.Flags.low_delay
+    ctx.options = {
+        "fflags": "nobuffer",
+    }
+    ctx.open()
+    return ctx
+
+def decode_h264_packet_zero_copy(codec_context: av.CodecContext, packet_bytes: bytes):
+    """Decodes H.264 packet without byte duplication using memoryview."""
     try:
-        packet = av.Packet(packet_bytes)
+        packet = av.Packet(memoryview(packet_bytes))
         frames = codec_context.decode(packet)
         for frame in frames:
             return frame.to_ndarray(format="bgr24")
     except Exception as e:
         print(f"[ERROR] H.264 Decoding Exception: {e}")
-        return None
     return None
 
 @router.websocket("/track/live")
 async def track_live(websocket: WebSocket):
     await websocket.accept()
-
     loop = asyncio.get_running_loop()
-    tracker = await loop.run_in_executor(executor, create_tracker)
 
-    # Initialize low-latency H.264 decoder context
-    codec_context = av.CodecContext.create('h264', 'r')
-    codec_context.thread_type = 'NONE'
-    codec_context.options = {'flags': 'low_delay'}
-    codec_context.open()
+    # Reuse global single-user TensorRT tracker engine
+    tracker = await loop.run_in_executor(tracker_executor, create_tracker)
+
+    # Per-request, isolated decoder context
+    codec_context = create_low_latency_codec_context()
 
     try:
         # Step 1: Receive Initial Bounding Box Payload
@@ -49,29 +58,51 @@ async def track_live(websocket: WebSocket):
             await websocket.close()
             return
 
-        # Step 2: Receive and decode keyframe to initialize tracker
+        # Step 2: Receive and decode initial keyframe (with attempt threshold)
         first_frame = None
+        attempts = 0
+        max_attempts = 30  # Safety threshold against infinite loops on corrupted streams
+
         while first_frame is None:
+            if attempts >= max_attempts:
+                await websocket.send_json({"error": "Failed to decode initial keyframe."})
+                await websocket.close()
+                return
+
             first_packet_bytes = await websocket.receive_bytes()
             first_frame = await loop.run_in_executor(
-                executor, decode_h264_packet, codec_context, first_packet_bytes
+                decoder_executor, 
+                decode_h264_packet_zero_copy, 
+                codec_context, 
+                first_packet_bytes
             )
+            attempts += 1
 
-        await loop.run_in_executor(executor, tracker.init_from_bbox, first_frame, bbox)
+        await loop.run_in_executor(tracker_executor, tracker.init_from_bbox, first_frame, bbox)
         await websocket.send_json({"status": "initialized", "bbox": list(bbox)})
 
-        # Step 3: Tracking Loop
+        # Step 3: Single-pass Live Tracking Loop
         while True:
             data = await websocket.receive_bytes()
 
             frame = await loop.run_in_executor(
-                executor, decode_h264_packet, codec_context, data
+                decoder_executor,
+                decode_h264_packet_zero_copy,
+                codec_context,
+                data
             )
 
             if frame is None:
                 continue
 
-            result = await loop.run_in_executor(executor, tracker.tracking, frame)
+            result = await loop.run_in_executor(
+                tracker_executor,
+                tracker.tracking,
+                frame
+            )
+
+            if result is None:
+                continue        
 
             await websocket.send_json({
                 "bbox": result["bbox"],
@@ -83,13 +114,21 @@ async def track_live(websocket: WebSocket):
 
     except WebSocketDisconnect:
         print("[INFO] Live tracking WebSocket disconnected safely.")
-    finally:
-        if hasattr(tracker, 'reset'):
-            await loop.run_in_executor(executor, tracker.reset)
+
 
 # ----------------------------------------------------------------------
-# Unified Offline Tracking (HTTP) - Unchanged (Video Upload file remains MP4/HTTP)
+# Async File I/O for Offline Video Tracking (HTTP POST)
 # ----------------------------------------------------------------------
+async def _write_upload_to_tempfile(upload_file: UploadFile) -> str:
+    """Synchronous disk write offloaded to io_executor."""
+    def _write_temp():
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            shutil.copyfileobj(upload_file.file, tmp)
+            return tmp.name
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(io_executor, _write_temp)
+
 @router.post("/track_video")
 async def track_video(
     video: UploadFile = File(...),
@@ -103,26 +142,29 @@ async def track_video(
             detail="Invalid bbox format. Use JSON array '[x, y, w, h]'."
         )
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        shutil.copyfileobj(video.file, tmp)
-        video_path = tmp.name
+    # Write video to disk in dedicated I/O pool
+    video_path = await _write_upload_to_tempfile(video)
     loop = asyncio.get_running_loop()
 
-    track_video = await loop.run_in_executor(executor, create_tracker)
-
+    # Reuse global single-user TensorRT tracker engine
+    tracker = await loop.run_in_executor(tracker_executor, create_tracker)
+    metrics = None
     try:
         metrics = await loop.run_in_executor(
-            executor,
-            track_video.track_offline,
+            tracker_executor,
+            tracker.track_offline,
             video_path,
             bbox_parsed,
             False
         )
-    finally:
-        track_video.reset()
-        path = Path(video_path)
-        if path.exists():
-            path.unlink()
+    finally:  
+        def _cleanup_file(path_str: str):
+            path = Path(path_str)
+            if path.exists():
+                path.unlink()
+
+        # Delete temp file via I/O executor
+        await loop.run_in_executor(io_executor, _cleanup_file, video_path)
 
     return {
         "status": "done",
