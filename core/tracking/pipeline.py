@@ -20,7 +20,6 @@ class TrackerConfig(object):
     lr = 0.295
     adaptive = True
 
-
     def update(self, cfg):
         for k, v in cfg.items():
             setattr(self, k, v)
@@ -38,7 +37,6 @@ def tracker_geometry_update(
     window_influence,
     lr_coef,
 ):
-
     cx = (delta[0] * anchor[:, 2] + anchor[:, 0]).to(anchor.dtype)
     cy = (delta[1] * anchor[:, 3] + anchor[:, 1]).to(anchor.dtype)
     w  = (torch.exp(delta[2]) * anchor[:, 2]).to(anchor.dtype)
@@ -98,29 +96,33 @@ def tracker_geometry_update(
         h[best] / scale_z * lr
     )
 
+    # FIX 1: Clone stacked tensors to prevent CUDA Graph memory buffer collisions
     return (
-        torch.stack([res_x, res_y]),
-        torch.stack([res_w, res_h]),
-        score[best]
+        torch.stack([res_x, res_y]).clone(),
+        torch.stack([res_w, res_h]).clone(),
+        score[best].clone()
     )
 
 @torch.inference_mode()
 def DaSiamRPN_init(im, target_pos, target_sz, net):
     device = im.device
-    target_dtype = im.dtype  # Capture image array entry type context
+    target_dtype = im.dtype
     state = dict()
     p = TrackerConfig()
     p.update(getattr(net, 'cfg', {}))
 
     state['im_h'] = im.shape[0]
     state['im_w'] = im.shape[1]
+
     if device.type == "cpu":
         state["geometry"] = tracker_geometry_update
     else:
+        # FIX 2: Disable triton cudagraphs for small geometry updates to avoid state bugs
         state["geometry"] = torch.compile(
             tracker_geometry_update,
-            mode="reduce-overhead",
+            options={"triton.cudagraphs": False}
         )
+
     if not isinstance(target_pos, torch.Tensor):
         target_pos = torch.tensor(target_pos, dtype=torch.float32, device=device)
     else:
@@ -138,7 +140,6 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
             p.instance_size = 271
         p.score_size = (p.instance_size - p.exemplar_size) // p.total_stride + 1
 
-    # Keep structural generation floating point, cast down inside runtime loops
     p.anchor = generate_anchors(
         p.total_stride,
         p.scales,
@@ -166,7 +167,6 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
     state["cls1_kernel"] = cls1_kernel
     state["anchor"] = p.anchor.to(dtype=r1_kernel.dtype)
 
-
     if p.windowing == 'cosine':
         hanning_1d = torch.hann_window(int(p.score_size), periodic=False, device=device, dtype=target_dtype)
         window_2d = torch.outer(hanning_1d, hanning_1d)
@@ -184,6 +184,10 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
 
 @torch.inference_mode()
 def DaSiamRPN_track(state, im):
+    # FIX 3: Notify PyTorch Inductor that a new frame step is starting inside tracking loop
+    if im.device.type == "cuda":
+        torch.compiler.cudagraph_mark_step_begin()
+
     p = state['p']
     net = state['net']
     avg_chans = state['avg_chans']
@@ -234,11 +238,17 @@ def DaSiamRPN_track(state, im):
         p.lr,
     )
 
-    # Force continuous floating points for target geometry clamp limits
-    target_pos[0] = torch.clamp(target_pos[0], min=0.0, max=float(state['im_w']))
-    target_pos[1] = torch.clamp(target_pos[1], min=0.0, max=float(state['im_h']))
-    target_sz[0] = torch.clamp(target_sz[0], min=10.0, max=float(state['im_w']))
-    target_sz[1] = torch.clamp(target_sz[1], min=10.0, max=float(state['im_h']))
+    # FIX 4: Out-of-place clamping to prevent graph buffer corruption
+    target_pos = torch.clamp(
+        target_pos, 
+        min=torch.tensor([0.0, 0.0], device=im.device), 
+        max=torch.tensor([float(state['im_w']), float(state['im_h'])], device=im.device)
+    )
+    target_sz = torch.clamp(
+        target_sz, 
+        min=torch.tensor([10.0, 10.0], device=im.device), 
+        max=torch.tensor([float(state['im_w']), float(state['im_h'])], device=im.device)
+    )
 
     state['target_pos'] = target_pos
     state['target_sz'] = target_sz
