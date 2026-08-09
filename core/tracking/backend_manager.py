@@ -267,7 +267,6 @@ class ONNXNet:
                 torch.from_numpy(classification).to(device=self.device, dtype=self.dtype),
             )
 
-
 class BackendManager:
     def __init__(self,
                  model_path: str = 'models/SiamRPNOTB.model',
@@ -297,8 +296,8 @@ class BackendManager:
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
-            major, _ = torch.cuda.get_device_capability(0)
-            self.dtype = torch.bfloat16 if major >= 8 else torch.float16
+            # Force float16 for ONNX/TRT compatibility (bfloat16 is invalid in ONNX standard Conv ops)
+            self.dtype = torch.float16
             self.device_name = torch.cuda.get_device_name(0)
 
         elif (
@@ -345,7 +344,8 @@ class BackendManager:
             print(f"[INFO] Exporting search.onnx...")
             dummy_x = torch.zeros(1, 3, self.instance_size, self.instance_size, device=self.device, dtype=self.dtype)
 
-            with torch.inference_mode():
+            # Disable autocast so ONNX export preserves float16/float32 precision cleanly
+            with torch.inference_mode(), torch.autocast(device_type=self.device.type, enabled=False):
                 onnx_dir = os.path.dirname(self.onnx_path)
                 if onnx_dir:
                     os.makedirs(onnx_dir, exist_ok=True)
@@ -373,7 +373,7 @@ class BackendManager:
                 onnx_path=self.onnx_path,
                 score_size=self.score_size,
                 anchor_num=self.anchor_num,
-                device = self.device,
+                device=self.device,
                 dtype=self.dtype
             )
 
