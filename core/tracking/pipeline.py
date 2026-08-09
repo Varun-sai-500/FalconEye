@@ -114,14 +114,7 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
     state['im_h'] = im.shape[0]
     state['im_w'] = im.shape[1]
 
-    if device.type == "cpu":
-        state["geometry"] = tracker_geometry_update
-    else:
-        # FIX 2: Disable triton cudagraphs for small geometry updates to avoid state bugs
-        state["geometry"] = torch.compile(
-            tracker_geometry_update,
-            options={"triton.cudagraphs": False}
-        )
+    state["geometry"] = tracker_geometry_update
 
     if not isinstance(target_pos, torch.Tensor):
         target_pos = torch.tensor(target_pos, dtype=torch.float32, device=device)
@@ -184,10 +177,6 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
 
 @torch.inference_mode()
 def DaSiamRPN_track(state, im):
-    # FIX 3: Notify PyTorch Inductor that a new frame step is starting inside tracking loop
-    if im.device.type == "cuda":
-        torch.compiler.cudagraph_mark_step_begin()
-
     p = state['p']
     net = state['net']
     avg_chans = state['avg_chans']
