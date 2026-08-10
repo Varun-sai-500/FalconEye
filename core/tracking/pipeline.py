@@ -96,11 +96,10 @@ def tracker_geometry_update(
         h[best] / scale_z * lr
     )
 
-    # FIX 1: Clone stacked tensors to prevent CUDA Graph memory buffer collisions
     return (
-        torch.stack([res_x, res_y]).clone(),
-        torch.stack([res_w, res_h]).clone(),
-        score[best].clone()
+        torch.stack([res_x, res_y]),
+        torch.stack([res_w, res_h]),
+        score[best]
     )
 
 @torch.inference_mode()
@@ -113,6 +112,30 @@ def DaSiamRPN_init(im, target_pos, target_sz, net):
 
     state['im_h'] = im.shape[0]
     state['im_w'] = im.shape[1]
+
+    state["pos_min"] = torch.tensor(
+        [0.0, 0.0],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    state["pos_max"] = torch.tensor(
+        [float(state["im_w"]), float(state["im_h"])],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    state["size_min"] = torch.tensor(
+        [10.0, 10.0],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    state["size_max"] = torch.tensor(
+        [float(state["im_w"]), float(state["im_h"])],
+        dtype=torch.float32,
+        device=device,
+    )
 
     state["geometry"] = tracker_geometry_update
 
@@ -227,16 +250,16 @@ def DaSiamRPN_track(state, im):
         p.lr,
     )
 
-    # FIX 4: Out-of-place clamping to prevent graph buffer corruption
     target_pos = torch.clamp(
-        target_pos, 
-        min=torch.tensor([0.0, 0.0], device=im.device), 
-        max=torch.tensor([float(state['im_w']), float(state['im_h'])], device=im.device)
+        target_pos,
+        min=state["pos_min"],
+        max=state["pos_max"],
     )
+
     target_sz = torch.clamp(
-        target_sz, 
-        min=torch.tensor([10.0, 10.0], device=im.device), 
-        max=torch.tensor([float(state['im_w']), float(state['im_h'])], device=im.device)
+        target_sz,
+        min=state["size_min"],
+        max=state["size_max"],
     )
 
     state['target_pos'] = target_pos
