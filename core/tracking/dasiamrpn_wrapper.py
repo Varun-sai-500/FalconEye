@@ -42,6 +42,7 @@ class DaSiamRPNTracker:
 
         self._active_pt_net              = None
         self._pinned_u8: Optional[torch.Tensor] = None   # uint8 pinned staging buffer
+        self._frame_gpu: Optional[torch.Tensor] = None
 
         self.state           = None
         self.last_good_state = None
@@ -93,16 +94,20 @@ class DaSiamRPNTracker:
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
         """
-        numpy BGR uint8 → tensor on self.device in self.dtype.
+        numpy BGR uint8 → persistent GPU tensor in self.dtype.
 
         CUDA:
-            numpy → pinned uint8 → non-blocking HtoD → dtype conversion on GPU.
+            numpy → pinned uint8 staging buffer
+                → persistent GPU buffer via async HtoD + dtype conversion
 
         CPU/MPS:
             numpy → tensor → device/dtype conversion directly.
         """
         if self.device.type == "cuda":
-            # Re-allocate pinned buffer only when frame shape changes.
+
+            # --------------------------------------------------------------
+            # Persistent pinned CPU staging buffer
+            # --------------------------------------------------------------
             if (
                 self._pinned_u8 is None
                 or self._pinned_u8.shape != torch.Size(frame.shape)
@@ -113,24 +118,47 @@ class DaSiamRPNTracker:
                     pin_memory=True,
                 )
 
-            # numpy → pinned uint8
+            # numpy → pinned CPU buffer
             self._pinned_u8.copy_(torch.from_numpy(frame))
 
-            # H→D + GPU dtype conversion
-            with self.backend.stream_context():
-                frame_tensor = self._pinned_u8.to(
+            H, W, C = frame.shape
+
+            # --------------------------------------------------------------
+            # Persistent GPU frame buffer
+            # --------------------------------------------------------------
+            if (
+                self._frame_gpu is None
+                or self._frame_gpu.shape != torch.Size((H, W, C))
+                or self._frame_gpu.dtype != self.dtype
+                or self._frame_gpu.device != self.device
+            ):
+                self._frame_gpu = torch.empty(
+                    (H, W, C),
                     device=self.device,
+                    dtype=self.dtype,
+                )
+
+            # --------------------------------------------------------------
+            # H2D + dtype conversion on BackendManager-owned stream
+            # --------------------------------------------------------------
+            with self.backend.stream_context():
+
+                # Copy uint8 → GPU dtype directly into persistent buffer.
+                self._frame_gpu.copy_(
+                    self._pinned_u8,
                     non_blocking=True,
-                ).to(dtype=self.dtype)
+                )
 
-            return frame_tensor
+            return self._frame_gpu
 
+        # ------------------------------------------------------------------
         # CPU / MPS
+        # ------------------------------------------------------------------
         return torch.from_numpy(frame).to(
             device=self.device,
             dtype=self.dtype,
         )
-
+    
     @staticmethod
     def _clone_state(state: dict) -> dict:
         """Shallow-copy state dict, cloning only the tensor leaves."""
