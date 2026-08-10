@@ -10,11 +10,3 @@ services:
       - "8080:8080"
     restart: unless-stopped
     gpus: all
-
-  gradio:
-    image: falconeye:latest
-    command: python app.py
-    ports:
-      - "7860:7860"
-    restart: unless-stopped
-    gpus: all
