@@ -93,12 +93,13 @@ class DaSiamRPNTracker:
 
     def _frame_to_gpu(self, frame: np.ndarray) -> torch.Tensor:
         """
-        uint8 numpy BGR → GPU tensor in self.dtype.
+        numpy BGR uint8 → tensor on self.device in self.dtype.
 
-        CUDA path:   copy raw uint8 into pinned staging buffer → non_blocking
-                     HtoD → cast to dtype on device.
-                     Keeps dtype conversion on the GPU, not the host.
-        MPS / CPU:   single .to() call, no pinned memory.
+        CUDA:
+            numpy → pinned uint8 → non-blocking HtoD → dtype conversion on GPU.
+
+        CPU/MPS:
+            numpy → tensor → device/dtype conversion directly.
         """
         if self.device.type == "cuda":
             # Re-allocate pinned buffer only when frame shape changes.
@@ -115,14 +116,20 @@ class DaSiamRPNTracker:
             # numpy → pinned uint8
             self._pinned_u8.copy_(torch.from_numpy(frame))
 
-            # H→D + GPU dtype conversion on BackendManager's stream
+            # H→D + GPU dtype conversion
             with self.backend.stream_context():
-                frame_gpu = self._pinned_u8.to(
+                frame_tensor = self._pinned_u8.to(
                     device=self.device,
                     non_blocking=True,
                 ).to(dtype=self.dtype)
 
-            return frame_gpu
+            return frame_tensor
+
+        # CPU / MPS
+        return torch.from_numpy(frame).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     @staticmethod
     def _clone_state(state: dict) -> dict:
