@@ -224,7 +224,7 @@ python -m pip install -r requirements-gpu.txt
 ```
 ## Running FalconEye
 
-### Gradio Interface
+### Qt (PySide6) Interface
 
 ```bash
 python app.py
@@ -247,23 +247,12 @@ The image contains the complete application stack, including:
 - TensorRT
 - ONNX Runtime GPU
 - FastAPI
-- Gradio
+- PySide6
 - All FalconEye modules and dependencies
 
-Using Docker Compose, two independent services are launched from the same image:
-
-```
-                FalconEye Image
-                       │
-          ┌────────────┴────────────┐
-          │                         │
-          ▼                         ▼
-     FastAPI Service          Gradio Service
-      Port: 8080               Port: 7860
-```
 
 - **FastAPI (`api/main.py`)** exposes REST endpoints for segmentation, tracking, and following.
-- **Gradio (`app.py`)** provides an interactive web interface.
+- **PySide6 (`app.py`)** provides an interactive desktop interface.
 - Both services share the same codebase, models, and weights while running as independent containers.
 
 ---
@@ -292,11 +281,10 @@ After startup:
 
 | Service | URL |
 |---------|-----|
-| Gradio UI | http://localhost:7860 |
 | FastAPI API | http://localhost:8080 |
 | Swagger Docs | http://localhost:8080/docs |
 
-To stop all services:
+To stop service:
 
 ```bash
 docker compose down
