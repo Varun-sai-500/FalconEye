@@ -154,8 +154,7 @@ async def track_video(
             tracker_executor,
             tracker.track_offline,
             video_path,
-            bbox_parsed,
-            False
+            bbox_parsed
         )
     finally:  
         def _cleanup_file(path_str: str):
