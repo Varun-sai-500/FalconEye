@@ -337,8 +337,7 @@ class DaSiamRPNTracker:
     def track_offline(
         self,
         video_src: str,
-        bbox: tuple[int, int, int, int],
-        display: bool = False,
+        bbox: tuple[int, int, int, int]
     ) -> dict:
         """
         Processes a full video sequence sequentially.
@@ -417,19 +416,13 @@ class DaSiamRPNTracker:
                 lost_flags.append(lost)
                 bbox_history.append(res_bbox if not lost else None)
 
-                if not lost or display:
+                if not lost:
                     draw = frame.copy()
-                    if not lost:
-                        x, y, w, h = res_bbox
-                        cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    x, y, w, h = res_bbox
+                    cv2.rectangle(draw, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     writer.write(draw)
                 else:
                     writer.write(frame)
-
-                if display:
-                    cv2.imshow("Tracking", draw if (not lost or display) else frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
 
                 # ── Tracklet diagnostics ──────────────────────────────
                 if not lost:
@@ -448,8 +441,6 @@ class DaSiamRPNTracker:
         finally:
             cap.release()
             writer.release()
-            if display:
-                cv2.destroyAllWindows()
             print(f"[INFO] Tracked video saved → {out_filepath}")
 
         if current_tracklet_len > 0:
