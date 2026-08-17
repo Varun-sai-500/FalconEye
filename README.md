@@ -48,6 +48,12 @@ Traditional visual tracking systems typically require manually initializing a tr
 
 FalconEye unifies these stages into a single end-to-end pipeline. By allowing users to specify a target through intuitive prompts—such as a click, reference image, or text description—the system bridges modern vision foundation models with autonomous robotics. Its modular design enables seamless transition from research workflows to real-time edge deployment on NVIDIA Jetson hardware.
 
+| Backend | Precision | Pure Inference FPS | End-to-End FPS | Mean Latency | P95 Latency | P99 Latency | Failure Rate |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **TensorRT** | FP16 | **3,843.32** | **405.75** | **2.46 ms** | **3.76 ms** | **11.23 ms** | **0.00%** |
+| ONNX | FP16 | 1,556.72 | 299.66 | 3.34 ms | 9.49 ms | 17.58 ms | 0.00% |
+| PyTorch | FP16 | 1,469.50 | 291.82 | 3.43 ms | 5.58 ms | 19.53 ms | 0.00% |
+
 ## End-to-End Pipeline
 
 <p align="center">
