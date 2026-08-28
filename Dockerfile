@@ -16,6 +16,6 @@ COPY requirements-gpu.txt .
 
 RUN python -m pip install \
     --break-system-packages \
-    -r requirements-gpu.txt
+    -r requirements.txt
 
 COPY . .
