@@ -1,19 +1,11 @@
 FROM pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CUDA_HOME=/usr/local/cuda \
-    NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        git \
-        ffmpeg \
-        curl \
         ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
@@ -26,4 +18,6 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . .
 
-CMD ["python", "app.py"]
+EXPOSE 8080
+
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8080"]
