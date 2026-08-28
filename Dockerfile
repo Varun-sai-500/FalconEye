@@ -1,21 +1,29 @@
-FROM pytorch/pytorch:2.12.1-cuda13.0-cudnn9-runtime
+FROM pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime
 
-WORKDIR /app
-
-ENV PYTHONUNBUFFERED=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        git \
         ffmpeg \
-        libgl1 \
-        libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+        curl \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-COPY requirements-gpu.txt .
+WORKDIR /workspace
 
-RUN python -m pip install \
-    --break-system-packages \
-    -r requirements.txt
+COPY requirements.txt .
+
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --break-system-packages -r requirements.txt
 
 COPY . .
+
+CMD ["python", "app.py"]
