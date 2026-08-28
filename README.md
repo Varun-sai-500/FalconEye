@@ -3,6 +3,7 @@
 > **A Modular Prompt-Guided Perception and Tracking System for Autonomous Following**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![C++](https://img.shields.io/badge/C++-17-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
 ![Qt / PySide6](https://img.shields.io/badge/Qt_PySide6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
@@ -11,6 +12,7 @@
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-005CED?style=for-the-badge&logo=onnx&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Jetson](https://img.shields.io/badge/NVIDIA-Jetson-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
+![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)
 
 
 ## 📑 Table of Contents
