@@ -48,6 +48,8 @@ Traditional visual tracking systems typically require manually initializing a tr
 
 FalconEye unifies these stages into a single end-to-end pipeline. By allowing users to specify a target through intuitive prompts—such as a click, reference image, or text description—the system bridges modern vision foundation models with autonomous robotics. Its modular design enables seamless transition from research workflows to real-time edge deployment on NVIDIA Jetson hardware.
 
+## Performance
+
 | Backend | Precision | Pure Inference FPS | End-to-End FPS | Mean Latency | P95 Latency | P99 Latency | Failure Rate |
 |---|---|---:|---:|---:|---:|---:|---:|
 | **TensorRT** | FP16 | **3,843.32** | **405.75** | **2.46 ms** | **3.76 ms** | **11.23 ms** | **0.00%** |
@@ -61,6 +63,10 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 </p>
 
 ## Features
+
+<p align="center">
+  <img src="assets/frontend.png" width="100%" alt="FalconEye User Interface">
+</p>
 
 - **Multi-modal target specification** — click prompt (SAM), reference image or
   text prompt (CLIPSeg) — no need to retrain for a new target class.
@@ -136,7 +142,6 @@ FalconEye/
 │       └── follow.py
 │
 ├── assets/                  # README assets
-│   ├── demo.gif
 │   ├── pipeline.png
 │   ├── architecture.png
 │   └── block.png
@@ -154,12 +159,11 @@ FalconEye/
 │
 ├── weights/                 # Model checkpoints
 │
-├── app.py                   # Gradio interface
+├── app.py                   # PySide6 interface
 ├── Dockerfile
 ├── docker-compose.ghcr.yml  # for deployment
 ├── docker-compose.yml       # for end users to build/develop
-├── requirements-cpu.txt
-├── requirements-gpu.txt
+├── requirements.txt
 ├── README.md
 └── LICENSE
 ```
@@ -167,115 +171,84 @@ FalconEye/
 The repository follows a modular architecture that separates the presentation layer, API layer, AI inference pipeline, and motion control components. This organization enables individual perception models, tracking algorithms, and deployment backends to be developed and extended independently.
 
 
+# Getting Started
 
-## Getting started
+FalconEye supports two deployment paths:
 
-### 1. Download the model checkpoints
+| Hardware | Recommended Deployment |
+| :--- | :--- |
+| **CPU** | Native Python installation |
+| **NVIDIA GPU** | Docker with the prebuilt GHCR image |
 
-Download the recommended DaSiamRPN OTB checkpoint from the **latest GitHub Release** and place it in the weights/ directory.
+> **Note:** The prebuilt Docker image is FalconEye's canonical GPU deployment. GPU users should not install FalconEye's Python dependencies manually.
 
+---
 
-### 2. Install the dependencies
+## 1. CPU Installation
 
-#### CPU Installation
-
-Create and activate a virtual environment:
+### Step 1: Create and activate a virtual environment
 
 ```bash
 python -m venv venv
 ```
 
-**Linux / macOS**
+* **Linux / macOS:**
+  ```bash
+  source venv/bin/activate
+  ```
+* **Windows (PowerShell):**
+  ```powershell
+  .\venv\Scripts\Activate.ps1
+  ```
+* **Windows (Command Prompt):**
+  ```cmd
+  venv\Scripts\activate.bat
+  ```
 
-```bash
-source venv/bin/activate
-```
-
-**Windows (PowerShell)**
-
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-**Windows (Command Prompt)**
-
-```cmd
-venv\Scripts\activate.bat
-```
-
-Upgrade pip:
+### Step 2: Upgrade pip
 
 ```bash
 python -m pip install --upgrade pip
 ```
 
+### Step 3: Install the dependencies
+
 ```bash
-python -m pip install -r requirements-cpu.txt
+python -m pip install -r requirements.txt
 ```
+
+> **Important:** The provided `requirements.txt` contains GPU-oriented dependencies. CPU users should replace or remove GPU-specific packages such as `onnxruntime-gpu` and `tensorrt`, and install the appropriate CPU build of PyTorch, TorchVision, and TorchAudio for their platform.  
+> For PyTorch installation instructions, see the official [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
 
-#### GPU Installation (Native)
+## 2. GPU Installation — Docker
 
-Create and activate a virtual environment as above.
+Docker is the canonical GPU deployment method for FalconEye.
 
-Install the appropriate CUDA-compatible PyTorch build for your system:
-
-https://pytorch.org/get-started/locally/
-
-Then install the GPU dependencies:
-
-```bash
-python -m pip install -r requirements-gpu.txt
-```
-## Running FalconEye
-
-### Qt (PySide6) Interface
-
-```bash
-python app.py
-```
-
-### FastAPI Server
-
-```bash
-uvicorn api.main:app --host 0.0.0.0 --port 8080
-```
-
----
-# 🐳 Docker (Recommended for GPU)
-
-FalconEye provides a prebuilt GPU Docker image through GitHub Container Registry (GHCR).
-
-The image contains the complete application stack, including:
+FalconEye provides a prebuilt GPU image through GitHub Container Registry (GHCR). The image includes the complete FalconEye runtime, including:
 
 - PyTorch
 - TensorRT
 - ONNX Runtime GPU
 - FastAPI
 - PySide6
-- All FalconEye modules and dependencies
+- FalconEye modules
+- Model weights
 
+### Pull and Run the Prebuilt Image
 
-- **FastAPI (`api/main.py`)** exposes REST endpoints for segmentation, tracking, and following.
-- **PySide6 (`app.py`)** provides an interactive desktop interface.
-- Both services share the same codebase, models, and weights while running as independent containers.
-
----
-
-## Option 1: Run the Prebuilt Image (Recommended)
-
-Start the application:
+GPU users can pull and start the prebuilt image directly:
 
 ```bash
 docker compose -f docker-compose.ghcr.yml up
 ```
 
----
+Docker Compose will pull the image from GHCR automatically if it is not already available locally.
 
-## Option 2: Build from Source
+### Build from Source
 
-Build the image locally:
+For development or when modifying the Docker image, you can build it locally:
 
 ```bash
 docker compose up --build
@@ -283,14 +256,31 @@ docker compose up --build
 
 ---
 
+## Running FalconEye
+
+### Native CPU Installation
+
+* **Qt (PySide6) Interface:**
+  ```bash
+  python app.py
+  ```
+* **FastAPI Server:**
+  ```bash
+  uvicorn api.main:app --host 0.0.0.0 --port 8080
+  ```
+
+### Docker GPU Installation
+
+The Docker Compose configuration starts FalconEye using the containerized application stack.
+
 After startup:
 
 | Service | URL |
-|---------|-----|
-| FastAPI API | http://localhost:8080 |
-| Swagger Docs | http://localhost:8080/docs |
+| :--- | :--- |
+| **FastAPI API** | `http://localhost:8080` |
+| **Swagger Docs** | `http://localhost:8080/docs` |
 
-To stop service:
+To stop the containers:
 
 ```bash
 docker compose down
@@ -322,6 +312,7 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 - [x] Separation of backend manager with tracking wrapper
 - [x] Single Synchronization point for tracker
 
+- [ ] GStreamer integration
 - [ ] Future Re-Identification case - SAM usage when confidence drops
 - [ ] Improve Tracker - use dasiamrpn's outputs
 
