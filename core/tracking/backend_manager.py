@@ -3,6 +3,10 @@ import time
 import numpy as np
 import torch
 from core.tracking.dasiamrpn import DaSiamRPNotb
+from huggingface_hub import hf_hub_download
+
+HF_REPO_ID = "Varun-Sai-500/DaSiamRPN"
+HF_MODEL_FILENAME = "SiamRPNOTB.model"
 
 torch.set_grad_enabled(False)
 
@@ -355,7 +359,7 @@ class ONNXNet:
 class BackendManager:
     def __init__(
         self,
-        model_path: str = 'models/SiamRPNOTB.model',
+        model_path: str | None = None,
         onnx_path: str = 'weights/search.onnx',
         trt_path: str = 'weights/search.engine',
         use_onnx: bool = True,
@@ -366,6 +370,11 @@ class BackendManager:
         anchor_num: int = 5,
         benchmark: bool = False,
     ):
+        if model_path is None:
+            model_path = hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=HF_MODEL_FILENAME,
+            )
         self.model_path = model_path
         self.onnx_path = onnx_path
         self.trt_path = trt_path
@@ -418,6 +427,7 @@ class BackendManager:
         self.pt_net = DaSiamRPNotb()
 
         if os.path.exists(model_path):
+            
             self.pt_net.load_state_dict(
                 torch.load(
                     model_path,
