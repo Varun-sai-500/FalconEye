@@ -1,18 +1,18 @@
-from pathlib import Path
+from huggingface_hub import hf_hub_download
+
 from core.tracking.dasiamrpn_wrapper import DaSiamRPNTracker
 
-TRACKER_MODEL_PATH = Path("weights/SiamRPNOTB.model")
+HF_REPO_ID = "Varun-Sai-500/DaSiamRPN"
+HF_FILENAME = "SiamRPNOTB.model"
 
 def create_tracker() -> DaSiamRPNTracker:
     """
     Each caller receives an independent tracker with its own internal state,
     making it suitable for per-session usage in FastAPI/WebSocket handlers.
     """
-    if not TRACKER_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Tracker checkpoint not found: '{TRACKER_MODEL_PATH}'.\n"
-            "Download the DaSiamRPN OTB checkpoint from the latest GitHub Release "
-            "and place it in the 'weights/' directory."
-        )
+    model_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_FILENAME,
+    )
 
-    return DaSiamRPNTracker(model_path=str(TRACKER_MODEL_PATH))
+    return DaSiamRPNTracker(model_path=model_path)
