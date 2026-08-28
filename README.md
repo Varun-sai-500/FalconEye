@@ -5,9 +5,11 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
-![Gradio](https://img.shields.io/badge/Gradio-FFB000?style=for-the-badge&logo=gradio&logoColor=black)
+![Qt / PySide6](https://img.shields.io/badge/Qt_PySide6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
+![NVIDIA RTX](https://img.shields.io/badge/NVIDIA_RTX-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![TensorRT](https://img.shields.io/badge/TensorRT-NVIDIA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-005CED?style=for-the-badge&logo=onnx&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Jetson](https://img.shields.io/badge/NVIDIA-Jetson-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 
 
@@ -142,9 +144,10 @@ FalconEye/
 │       └── follow.py
 │
 ├── assets/                  # README assets
-│   ├── pipeline.png
 │   ├── architecture.png
-│   └── block.png
+│   ├── block.png
+|   ├──frontend.jpg
+|   └──pipeline.png
 │
 ├── core/                    # Core AI modules
 │   ├── segmentation/         # SAM & CLIPSeg wrappers
@@ -156,8 +159,6 @@ FalconEye/
 │   ├── segmentation_service.py
 │   ├── tracking_service.py
 │   └── following_service.py
-│
-├── weights/                 # Model checkpoints
 │
 ├── app.py                   # PySide6 interface
 ├── Dockerfile
