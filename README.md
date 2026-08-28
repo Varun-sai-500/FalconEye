@@ -154,21 +154,23 @@ FalconEye/
 ├── core/                    # Core AI modules
 │   ├── segmentation/         # SAM & CLIPSeg wrappers
 │   ├── tracking/             # DaSiamRPN wrapper
-│   ├── following/            # Rover controller
-│   └── utils/                # Shared utilities
+│   └── following/            # Rover controller
 │
 ├── services/                # Business logic orchestration
 │   ├── segmentation_service.py
 │   ├── tracking_service.py
 │   └── following_service.py
 │
+├── .gitignore
+├── .gitattributes
+├── .dockerignore
 ├── app.py                   # PySide6 interface
-├── Dockerfile
 ├── docker-compose.ghcr.yml  # for deployment
 ├── docker-compose.yml       # for end users to build/develop
-├── requirements.txt
+├── Dockerfile
+├── LICENSE
 ├── README.md
-└── LICENSE
+└── requirements.txt
 ```
 
 The repository follows a modular architecture that separates the presentation layer, API layer, AI inference pipeline, and motion control components. This organization enables individual perception models, tracking algorithms, and deployment backends to be developed and extended independently.
