@@ -98,7 +98,7 @@ class DaSiamRPNTracker:
 
         CUDA:
             numpy → pinned uint8 staging buffer
-                → persistent GPU buffer via async HtoD + dtype conversion
+                → persistent GPU buffer via async HtoD + dtype conversion // bottleneck
 
         CPU/MPS:
             numpy → tensor → device/dtype conversion directly.
