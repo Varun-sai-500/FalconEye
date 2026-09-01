@@ -1,6 +1,6 @@
-# for installing PyTorch, TorchVision, and TorchAudio, please refer to the official installation guide
-# for appropriate build for your platform:
+# Install PyTorch separately using:
 # https://pytorch.org/get-started/locally/
+
 transformers
 opencv-python-headless
 fastapi
