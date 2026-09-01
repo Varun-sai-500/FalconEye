@@ -222,7 +222,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-> **Important:** The provided `requirements.txt` contains GPU-oriented dependencies. CPU users should replace or remove GPU-specific packages such as `onnxruntime-gpu` and `tensorrt`, and install the appropriate CPU build of PyTorch, TorchVision, and TorchAudio for their platform.  
+> **Important:** The provided `requirements.txt` contains GPU-oriented dependencies. CPU users should replace or remove GPU-specific packages such as `onnxruntime-gpu` and `tensorrt`, and install the appropriate CPU build of PyTorch for their platform.  
 > For PyTorch installation instructions, see the official [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
