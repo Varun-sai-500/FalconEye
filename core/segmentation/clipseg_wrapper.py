@@ -25,7 +25,7 @@ class CLIPSegWrapper:
         else:
             self.dtype = torch.float32
 
-        self.processor = CLIPSegProcessor.from_pretrained(model_id, backend="torchvision")
+        self.processor = CLIPSegProcessor.from_pretrained(model_id)
         self.model = CLIPSegForImageSegmentation.from_pretrained(
             model_id, torch_dtype=self.dtype
         ).to(self.device)
