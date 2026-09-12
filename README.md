@@ -2,9 +2,9 @@
 
 > **A Modular Prompt-Guided Perception and Tracking System for Autonomous Following**
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.14+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![C++](https://img.shields.io/badge/C++-17-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
-![PyTorch](https://img.shields.io/badge/PyTorch-2.x-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.12-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
 ![Qt / PySide6](https://img.shields.io/badge/Qt_PySide6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![NVIDIA RTX](https://img.shields.io/badge/NVIDIA_RTX-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
@@ -46,6 +46,10 @@ It combines promptable segmentation (SAM, CLIPSeg), single-object visual trackin
 (DaSiamRPN), and a C++ real-time motion controller, deployed end-to-end on
 Jetson AGX Xavier hardware.
 
+<p align="center">
+  <img src="assets/demo.gif" width="900" alt="FalconEye object tracking demo">
+</p>
+
 ## Why FalconEye?
 
 Traditional visual tracking systems typically require manually initializing a tracker with a bounding box and often treat perception, tracking, and robot control as separate components.
@@ -54,7 +58,9 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 
 ## Performance
 
-| Backend | Precision | Pure Inference FPS | End-to-End FPS | Mean Latency | P95 Latency | P99 Latency | Failure Rate |
+> Performance metrics tested on NVIDIA RTX 3090 24GB VRAM (Desktop GPU)
+
+| Backend | Precision | Pure Inference FPS | Tracking Throughput | Mean Latency | P95 Latency | P99 Latency | Failure Rate |
 |---|---|---:|---:|---:|---:|---:|---:|
 | **TensorRT** | FP16 | **3,843.32** | **405.75** | **2.46 ms** | **3.76 ms** | **11.23 ms** | **0.00%** |
 | ONNX | FP16 | 1,556.72 | 299.66 | 3.34 ms | 9.49 ms | 17.58 ms | 0.00% |
@@ -81,13 +87,12 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 - **Multi-backend inference** — runtime-selectable PyTorch, ONNX, or TensorRT,
   chosen per deployment target (prototyping vs edge inference).
 
-- **Full-stack pipeline** — FastAPI backend (REST + WebSocket) with a Gradio
-  web UI, service-orchestration layer, and a C++ real-time motion controller.
+- **Full-stack pipeline** — FastAPI backend (REST + WebSocket) with a Qt frontend, service-orchestration layer, and a C++ real-time motion controller.
 
 - **Edge-deployed** — built and profiled for Jetson AGX Xavier, not just
-  desktop/cloud GPUs.
-
-- **Autonomous following** — segmentation + tracking output feeds directly into
+  desktop/cloud GPUs
+  
+- **Autonomous following** — Tracking output feeds directly into
   velocity/motion command generation for closed-loop rover control.
 
 ## 🏗️ Software Architecture
@@ -129,6 +134,12 @@ Segmentation, tracking, and following are each handled by a dedicated orchestrat
 service rather than a single monolithic handler — keeps the API layer thin and makes
 each pipeline stage independently testable.
 
+**Zero-Copy I/O Binding for Accelerated Inference**
+For ONNX Runtime and TensorRT, output regression and classification buffers are allocated once upfront on the target device. ONNX uses io_binding.bind_output and TensorRT binds pointers via set_tensor_address, completely bypassing intermediate CPU copies and runtime array instantiations.
+
+**Single Dedicated CUDA Stream Architecture**
+H2D transfers, kernel executions, and backend calls run on a single manager-owned torch.cuda.Stream. By executing and synchronizing on this explicit stream, cross-stream race conditions and unnecessary pipeline-wide CPU stalls are prevented without relying on global implicit stream synchronization.
+
 **Separation of Python decision logic and C++ motion control**
 High-level target state estimation and velocity computation run in Python, while the
 real-time motion controller is implemented in C++ — keeping hard real-time control
@@ -147,9 +158,10 @@ FalconEye/
 │
 ├── assets/                  # README assets
 │   ├── architecture.png
+|   ├── demo.gif
 │   ├── block.png
-|   ├──frontend.jpg
-|   └──pipeline.png
+|   ├── frontend.jpg
+|   └── pipeline.png
 │
 ├── core/                    # Core AI modules
 │   ├── segmentation/         # SAM & CLIPSeg wrappers
@@ -311,7 +323,7 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 
 ## 🛣️ Roadmap
 
-- [x] FastAPI & Gradio Integration
+- [x] FastAPI & Qt (PySide6) Integration
 - [x] ONNXRuntime Backend
 - [x] TensorRT Backend
 - [x] Separation of backend manager with tracking wrapper
@@ -330,12 +342,18 @@ FalconEye builds upon several outstanding open-source projects and research cont
 - **DaSiamRPN** — for robust distractor-aware Siamese object tracking.
 - **PyTorch** — for deep learning development and model execution.
 - **FastAPI** — for the REST API framework.
-- **Gradio** — for the interactive web interface.
+- **Qt** — for the interactive desktop app interface.
 - **ONNX Runtime** — for portable, hardware-accelerated inference.
-- **NVIDIA TensorRT** — for optimized edge inference on Jetson platforms.
+- **NVIDIA TensorRT** — for optimized edge inference on GPU.
 
 Thanks to the open-source ML/CV community whose tooling made a solo, full-stack
 build like this feasible in a reasonable timeframe.
+
+## 📄 License
+
+This project is licensed under the **Apache License 2.0**.
+
+You are free to use, modify, and distribute this software in accordance with the terms of the license. See the [LICENSE](LICENSE) file for the full license text.
 
 ## 📚 Citation
 
@@ -350,8 +368,3 @@ If you find FalconEye useful in your research or applications, please consider c
   note         = {GitHub repository}
 }
 ```
-## 📄 License
-
-This project is licensed under the **Apache License 2.0**.
-
-You are free to use, modify, and distribute this software in accordance with the terms of the license. See the [LICENSE](LICENSE) file for the full license text.
