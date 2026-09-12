@@ -11,4 +11,4 @@ python-multipart
 pyside6
 onnxruntime-gpu
 onnxscript
-tensorrt
+tensorrt==11.2.1.2
