@@ -9,7 +9,6 @@
 ![Qt / PySide6](https://img.shields.io/badge/Qt_PySide6-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![NVIDIA RTX](https://img.shields.io/badge/NVIDIA_RTX-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![TensorRT](https://img.shields.io/badge/TensorRT-NVIDIA-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
-![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-005CED?style=for-the-badge&logo=onnx&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![Jetson](https://img.shields.io/badge/NVIDIA-Jetson-76B900?style=for-the-badge&logo=nvidia&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)
@@ -63,7 +62,6 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 | Backend | Precision | Pure Inference FPS | Tracking Throughput | Mean Latency | P95 Latency | P99 Latency | Failure Rate |
 |---|---|---:|---:|---:|---:|---:|---:|
 | **TensorRT** | FP16 | **3,843.32** | **405.75** | **2.46 ms** | **3.76 ms** | **11.23 ms** | **0.00%** |
-| ONNX | FP16 | 1,556.72 | 299.66 | 3.34 ms | 9.49 ms | 17.58 ms | 0.00% |
 | PyTorch | FP16 | 1,469.50 | 291.82 | 3.43 ms | 5.58 ms | 19.53 ms | 0.00% |
 
 ## End-to-End Pipeline
@@ -84,7 +82,7 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 - **Real-time single-object tracking** — DaSiamRPN-based tracker maintains lock
   on the target across frames after initial segmentation.
 
-- **Multi-backend inference** — runtime-selectable PyTorch, ONNX, or TensorRT,
+- **Multi-backend inference** — runtime-selectable PyTorch, TensorRT,
   chosen per deployment target (prototyping vs edge inference).
 
 - **Full-stack pipeline** — FastAPI backend (REST + WebSocket) with a Qt frontend, service-orchestration layer, and a C++ real-time motion controller.
@@ -99,7 +97,7 @@ FalconEye unifies these stages into a single end-to-end pipeline. By allowing us
 
 FalconEye adopts a layered architecture to ensure modularity, extensibility, and maintainability. The system is organized into presentation, application, AI, and hardware layers, allowing each subsystem to evolve independently while communicating through well-defined interfaces.
 
-This design enables interchangeable perception models, multiple runtime backends (PyTorch, ONNX Runtime, TensorRT), and seamless deployment across desktop and edge hardware without modifying the higher-level application logic.
+This design enables interchangeable perception models, multiple runtime backends (PyTorch, TensorRT), and seamless deployment across desktop and edge hardware without modifying the higher-level application logic.
 
 <p align="center">
     <img src="assets/architecture.png" width="900">
@@ -135,7 +133,7 @@ service rather than a single monolithic handler — keeps the API layer thin and
 each pipeline stage independently testable.
 
 **Zero-Copy I/O Binding for Accelerated Inference**
-For ONNX Runtime and TensorRT, output regression and classification buffers are allocated once upfront on the target device. ONNX uses io_binding.bind_output and TensorRT binds pointers via set_tensor_address, completely bypassing intermediate CPU copies and runtime array instantiations.
+For TensorRT, output regression and classification buffers are allocated once upfront on the target device. TensorRT binds pointers via set_tensor_address, completely bypassing intermediate CPU copies and runtime array instantiations.
 
 **Single Dedicated CUDA Stream Architecture**
 H2D transfers, kernel executions, and backend calls run on a single manager-owned torch.cuda.Stream. By executing and synchronizing on this explicit stream, cross-stream race conditions and unnecessary pipeline-wide CPU stalls are prevented without relying on global implicit stream synchronization.
@@ -234,7 +232,7 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-> **Important:** The provided `requirements.txt` contains GPU-oriented dependencies. CPU users should replace or remove GPU-specific packages such as `onnxruntime-gpu` and `tensorrt`, and install the appropriate CPU build of PyTorch for their platform.  
+> **Important:** The provided `requirements.txt` contains GPU-oriented dependencies. CPU users should replace or remove GPU-specific packages such as `tensorrt`, and install the appropriate CPU build of PyTorch for their platform.  
 > For PyTorch installation instructions, see the official [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
 ---
@@ -247,7 +245,6 @@ FalconEye provides a prebuilt GPU image through GitHub Container Registry (GHCR)
 
 - PyTorch
 - TensorRT
-- ONNX Runtime GPU
 - FastAPI
 - PySide6
 - FalconEye modules
@@ -318,13 +315,11 @@ FalconEye supports multiple inference runtimes through a unified abstraction lay
 | Backend | Purpose |
 |---------|---------|
 | PyTorch | Development and debugging |
-| ONNX Runtime | Portable accelerated inference |
 | TensorRT | Optimized deployment on NVIDIA Jetson |
 
 ## 🛣️ Roadmap
 
 - [x] FastAPI & Qt (PySide6) Integration
-- [x] ONNXRuntime Backend
 - [x] TensorRT Backend
 - [x] Separation of backend manager with tracking wrapper
 - [x] Single Synchronization point for tracker
@@ -343,7 +338,6 @@ FalconEye builds upon several outstanding open-source projects and research cont
 - **PyTorch** — for deep learning development and model execution.
 - **FastAPI** — for the REST API framework.
 - **Qt** — for the interactive desktop app interface.
-- **ONNX Runtime** — for portable, hardware-accelerated inference.
 - **NVIDIA TensorRT** — for optimized edge inference on GPU.
 
 Thanks to the open-source ML/CV community whose tooling made a solo, full-stack

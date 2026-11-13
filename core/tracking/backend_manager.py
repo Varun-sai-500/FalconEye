@@ -20,13 +20,6 @@ except ImportError:
 CUDA_AVAILABLE = torch.cuda.is_available()
 TRT_AVAILABLE = TRT_INSTALLED and CUDA_AVAILABLE
 
-try:
-    import onnxruntime as ort
-    ORT_AVAILABLE = True
-except ImportError:
-    ORT_AVAILABLE = False
-    print("[WARN] onnxruntime not installed — using PyTorch inference")
-
 class TRTNet:
     def __init__(self, engine_path, score_size, anchor_num, device, dtype=torch.float16, logger=None,stream=None):
         self.logger = logger if logger is not None else trt.Logger(trt.Logger.WARNING)
@@ -229,133 +222,6 @@ class TRTNet:
         print(f"[INFO] TensorRT compilation successful → persistent engine mapped: '{trt_path}'")
 
 
-class ONNXNet:
-    def __init__(self, onnx_path, score_size, anchor_num,device, dtype=torch.float16, stream=None):
-        from onnx import TensorProto
-        self.device = device
-        self.dtype = dtype
-        if self.device.type == "cuda" and stream is None:
-            raise ValueError(
-                "ONNXNet requires the BackendManager-owned CUDA stream."
-            )
-
-        self._stream = stream
-        if self.dtype == torch.bfloat16:
-            self.ort_element_type = TensorProto.BFLOAT16
-        elif self.dtype == torch.float16:
-            self.ort_element_type = np.float16
-        else:
-            self.ort_element_type = np.float32
-
-        if ORT_AVAILABLE and CUDA_AVAILABLE:
-            providers = [
-                ('CUDAExecutionProvider', {
-                    'user_compute_stream': str(self.stream.cuda_stream),
-                }),
-                'CPUExecutionProvider',
-            ]
-        else:
-            providers = ['CPUExecutionProvider']
-
-        so = ort.SessionOptions()
-        self.session = ort.InferenceSession(onnx_path, sess_options=so, providers=providers)
-
-        inputs = self.session.get_inputs()
-        self.search_name = inputs[0].name
-        self.r1_name = inputs[1].name
-        self.cls1_name = inputs[2].name
-
-        self.output_names = [o.name for o in self.session.get_outputs()]
-        self.using_cuda = 'CUDAExecutionProvider' in self.session.get_providers()
-
-        if self.using_cuda:
-            self.io_binding = self.session.io_binding()
-
-            # Pre-allocate output buffers permanently
-            self.reg_buf = torch.empty((1, 4 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype)
-            self.cls_buf = torch.empty((1, 2 * anchor_num, score_size, score_size), device=self.device, dtype=self.dtype)
-
-            # TRUE ZERO-COPY: Bind outputs permanently right here in init
-            self.io_binding.bind_output(
-                name=self.output_names[0], device_type='cuda',
-                element_type=self.ort_element_type, shape=tuple(self.reg_buf.shape),device_id = 0,
-                buffer_ptr=self.reg_buf.data_ptr()
-            )
-            self.io_binding.bind_output(
-                name=self.output_names[1], device_type='cuda', 
-                element_type=self.ort_element_type, shape=tuple(self.cls_buf.shape),device_id = 0,
-                buffer_ptr=self.cls_buf.data_ptr()
-            )
-
-        print(f"[INFO] ONNX session initialized | provider: {self.session.get_providers()[0]}")
-
-    @property
-    def stream(self):
-        return self._stream
-    
-    def __call__(self, x_crop, r1_kernel, cls1_kernel):
-        if not torch.is_tensor(x_crop):
-            x_crop = torch.from_numpy(x_crop).to(self.device)
-
-        if self.using_cuda:
-            with torch.cuda.stream(self.stream):
-                x_crop = x_crop.contiguous().to(
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                r1_kernel = r1_kernel.contiguous().to(
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                cls1_kernel = cls1_kernel.contiguous().to(
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-
-                self.io_binding.clear_binding_inputs()
-
-                self.io_binding.bind_input(
-                    name=self.search_name,
-                    device_type='cuda',
-                    device_id = 0,
-                    element_type=self.ort_element_type,
-                    shape=tuple(x_crop.shape),
-                    buffer_ptr=x_crop.data_ptr(),
-                )
-
-                self.io_binding.bind_input(
-                    name=self.r1_name,
-                    device_type='cuda',
-                    device_id = 0,
-                    element_type=self.ort_element_type,
-                    shape=tuple(r1_kernel.shape),
-                    buffer_ptr=r1_kernel.data_ptr(),
-                )
-
-                self.io_binding.bind_input(
-                    name=self.cls1_name,
-                    device_type='cuda',
-                    device_id = 0,
-                    element_type=self.ort_element_type,
-                    shape=tuple(cls1_kernel.shape),
-                    buffer_ptr=cls1_kernel.data_ptr(),
-                )
-
-                self.session.run_with_iobinding(self.io_binding)
-
-            return self.reg_buf, self.cls_buf
-        else:
-            x_np = x_crop.cpu().to(self.dtype).numpy()
-            r1_np = r1_kernel.cpu().to(self.dtype).numpy()
-            cls1_np = cls1_kernel.cpu().to(self.dtype).numpy()
-
-            feeds = {self.search_name: x_np, self.r1_name: r1_np, self.cls1_name: cls1_np}
-            regression, classification = self.session.run(None, feeds)
-            return (
-                torch.from_numpy(regression).to(device=self.device, dtype=self.dtype),
-                torch.from_numpy(classification).to(device=self.device, dtype=self.dtype),
-            )
-
 class BackendManager:
     def __init__(
         self,
@@ -379,7 +245,7 @@ class BackendManager:
         self.onnx_path = onnx_path
         self.trt_path = trt_path
 
-        self.use_onnx = use_onnx and ORT_AVAILABLE
+        self.use_onnx = use_onnx 
         self.use_trt = TRT_AVAILABLE and torch.cuda.is_available()
 
         self.instance_size = instance_size
@@ -485,8 +351,6 @@ class BackendManager:
     def active_net(self):
         if self.trt_net is not None:
             return self.trt_net, "TensorRT"
-        if self.onnx_net is not None:
-            return self.onnx_net, "ONNX"
         return self.pt_net, "PyTorch"
 
     def get_pt_net(self):
@@ -525,15 +389,6 @@ class BackendManager:
                 except Exception as e:
                     print(f"[WARN] TensorRT automatic compilation aborted: {e}")
 
-            self.onnx_net = ONNXNet(
-                onnx_path=self.onnx_path,
-                score_size=self.score_size,
-                anchor_num=self.anchor_num,
-                device=self.device,
-                dtype=self.dtype,
-                stream=self.stream,
-            )
-
             if self.use_trt and os.path.exists(self.trt_path):
                 try:
                     self.trt_net = TRTNet(
@@ -545,7 +400,7 @@ class BackendManager:
                         stream=self.stream,
                     )
                 except Exception as e:
-                    print(f"[WARN] TensorRT Context map failed: {e} — falling back securely to ONNX.")
+                    print(f"[WARN] TensorRT Context map failed: {e}")
                     self.trt_net = None
 
         if self.benchmark:
@@ -566,7 +421,7 @@ class BackendManager:
 
         if CUDA_AVAILABLE:
             torch.cuda.synchronize()
-            if isinstance(net, (TRTNet, ONNXNet)):
+            if isinstance(net, (TRTNet)):
                 target_stream = net.stream
             else:
                 target_stream = torch.cuda.current_stream(self.device)
